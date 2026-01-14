@@ -1,0 +1,12 @@
+ap:
+  image:
+    repository: ghcr.io/llm-d/async-processor
+    tag: v0.0.1
+  imagePullPolicy: Never
+
+  metrics:
+    enabled: true
+    port: 8443
+    secure: true
+
+  
