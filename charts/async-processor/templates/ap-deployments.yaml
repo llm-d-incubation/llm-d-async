@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "async-processor.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "async-processor.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "async-processor.selectorLabels" . | nindent 6 }}
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        {{- include "async-processor.selectorLabels" . | nindent 8 }}
+    spec:
+      securityContext:
+        # Projects are configured by default to adhere to the "restricted" Pod Security Standards.
+        # This ensures that deployments meet the highest security requirements for Kubernetes.
+        # For more details, see: https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - command:
+        - /async-processor
+        args:
+          - --redis.inference-gateway
+          - "{{ .Values.ap.redis.inferenceGateway }}"
+          - --redis.addr
+          - "{{ .Values.ap.redis.host }}:6379"
+        image: "{{ .Values.ap.image.repository }}:{{ .Values.ap.image.tag }}"
+        imagePullPolicy: "{{ .Values.ap.imagePullPolicy }}"
+        env:
+          - name: LOG_LEVEL
+            value: {{ if .Values.ap.logging }}{{ .Values.ap.logging.level | default "info" | quote }}{{ else }}"info"{{ end }}
+        name: async-processor
+      serviceAccountName: {{ include "async-processor.fullname" . }}
+      terminationGracePeriodSeconds: 130

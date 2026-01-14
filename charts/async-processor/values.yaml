@@ -1,0 +1,17 @@
+ap:
+  image:
+    repository: ghcr.io/llm-d/async-processor
+    tag: v0.0.1
+  imagePullPolicy: Never
+
+  metrics:
+    enabled: true
+    port: 8443
+    secure: true
+
+  redis:
+     host: "redis-master.redis.svc.cluster.local"
+     inferenceGateway: "http://infra-sim-inference-gateway-istio.llm-d-sim.svc.cluster.local:80/v1/completions"
+  
+
+
