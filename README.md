@@ -51,9 +51,7 @@ TBD
 
 ## Command line parameters
 
-- `concurrency`: the number of concurrenct batch workers, default is 8.
-- `inference-gateway`: Inference gateway endppoint. Requests will be sent to this endpoint.
-- `inference-objective`: InferenceObjective to use for requests (set as the HTTP header x-gateway-inference-objective if not empty). 
+- `concurrency`: the number of concurrenct workers, default is 8.
 - `request-merge-policy`: Currently only supporting <u>random-robin</u> policy.
 - `message-queue-impl`: Currently only supporting <u>redis-pubsub</u> for ephemeral Redis-based implementation.
 
@@ -62,7 +60,7 @@ TBD
 
 ## Request Messages and Consusmption
 
-The batch processor expects request messages to have the following format:
+The async processor expects request messages to have the following format:
 ```json
 {
     "id" : "unique identifier for result mapping",
@@ -82,7 +80,7 @@ Example:
 
 ### Request Merge Policy
 
-The Batch Processor supports multiple request message queues. A `Request Merge Policy` can be specified to define the merge strategy of messages from the different queues.
+The Async Processor supports multiple request message queues. A `Request Merge Policy` can be specified to define the merge strategy of messages from the different queues.
 
 Currently the only policy supported is `Random Robin Policy` which randomly picks messages from the queues.
 
@@ -93,7 +91,7 @@ Currently the only policy supported is `Random Robin Policy` which randomly pick
 
 When a message processing has failed, either shedded or due to a server-side error, it will be scheduled for a retry (assuming the deadline has not passed).
 
-The batch processor supports exponential-backoff and fixed-rate backoff (TBD).
+The async processor supports exponential-backoff and fixed-rate backoff (TBD).
 
 ## Results
 
@@ -119,14 +117,17 @@ An example implementation based on Redis channels is provided.
 - Redis Channel as the result queue.
 
 
-![Batch Processor - Redis architecture](/docs/images/batch_processor_redis_architecture.png "BP - Redis")
+![Async Processor - Redis architecture](/docs/images/batch_processor_redis_architecture.png "BP - Redis")
 
 #### Redis Command line parameters
 
-- `redis.request-queue-name`: The name of the channel for the requests. Default is <u>batch-queue</u>.
-- `redis.retry-queue-name`: The name of the channel for the retries. Default is <u>batch-sortedset-retry</u>.
-- `redis.result-queue-name`: The name of the channel for the results. Default is <u>batch-queue-result</u>.
+- `redis.inference-gateway`: Inference gateway endppoint. Requests will be sent to this endpoint.
+- `redis.inference-objective`: InferenceObjective to use for requests (set as the HTTP header x-gateway-inference-objective if not empty). 
+- `redis.request-queue-name`: The name of the channel for the requests. Default is <u>request-queue</u>.
+- `redis.retry-queue-name`: The name of the channel for the retries. Default is <u>retry-sortedset</u>.
+- `redis.result-queue-name`: The name of the channel for the results. Default is <u>result-queue</u>.
 
+**NOTE:** the `redis.inference-gateway` and `redis.inference-objective` will soon migrate to a per request queue definitions so an index number will be added to the flag name.
 
 ### GCP Pub/Sub
 
@@ -143,7 +144,7 @@ Then, in a new terminal window register a subscriber:
 kubectl exec -n redis redis-master-0 -- redis-cli SUBSCRIBE result-queue
 ```
 
-Publish a message for batch processing:
+Publish a message for async processing:
 ```bash
 kubectl exec -n redis redis-master-0 -- redis-cli PUBLISH request-queue '{"id" : "testmsg", "payload":{ "model":"unsloth/Meta-Llama-3.1-8B", "prompt":"hi"}, "deadline" :"9999999999" }'
 ```
