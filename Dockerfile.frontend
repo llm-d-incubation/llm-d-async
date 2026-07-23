@@ -1,0 +1,23 @@
+# Build the OpenAI frontend binary
+FROM quay.io/projectquay/golang:1.26 AS builder
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /workspace
+# Local replace directives (../api, ../producer) must exist before go mod download.
+COPY api/ api/
+COPY producer/ producer/
+COPY frontend/go.mod frontend/go.mod
+COPY frontend/go.sum frontend/go.sum
+WORKDIR /workspace/frontend
+RUN go mod download
+
+COPY frontend/ /workspace/frontend/
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o llm-d-async-frontend ./cmd
+
+FROM gcr.io/distroless/static:nonroot
+WORKDIR /
+COPY --from=builder /workspace/frontend/llm-d-async-frontend .
+USER 65532:65532
+
+ENTRYPOINT ["/llm-d-async-frontend"]
