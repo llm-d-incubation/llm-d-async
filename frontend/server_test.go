@@ -1,6 +1,7 @@
 package frontend
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -103,7 +104,7 @@ func TestEnqueueMode(t *testing.T) {
 		Data api.RequestMessage `json:"data"`
 	}
 	require.NoError(t, json.Unmarshal([]byte(members[0]), &envelope))
-	assert.Equal(t, resultKey(id), envelope.Internal.ResultQueueName)
+	assert.Equal(t, resultKey("team-a", id), envelope.Internal.ResultQueueName)
 	assert.Equal(t, "/v1/chat/completions", envelope.Data.Endpoint)
 	assert.Equal(t, "team-a", envelope.Data.Metadata["team"])
 	assert.Equal(t, "test-model", envelope.Data.Payload["model"])
@@ -124,11 +125,11 @@ func TestClientSuppliedID(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), "my-id-1")
 }
 
-func storeResult(t *testing.T, env *testEnv, id string, res api.ResultMessage) {
+func storeResult(t *testing.T, env *testEnv, tenant, id string, res api.ResultMessage) {
 	t.Helper()
 	data, err := json.Marshal(res)
 	require.NoError(t, err)
-	require.NoError(t, env.rdb.LPush(t.Context(), resultKey(id), string(data)).Err())
+	require.NoError(t, env.rdb.LPush(t.Context(), resultKey(tenant, id), string(data)).Err())
 	// Result flush also cleans up the active-token key.
 	env.rdb.Del(t.Context(), api.RequestActiveTokenKey(id))
 }
@@ -155,7 +156,7 @@ func TestFetchLifecycle(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), "pending")
 
 	// Result arrives: fetch mirrors upstream status and body, idempotently.
-	storeResult(t, env, "fetch-1", api.ResultMessage{ID: "fetch-1", StatusCode: 200, Payload: `{"done":true}`})
+	storeResult(t, env, defaultTenant, "fetch-1", api.ResultMessage{ID: "fetch-1", StatusCode: 200, Payload: `{"done":true}`})
 	for range 2 {
 		req = httptest.NewRequest(http.MethodGet, "/v1/requests/fetch-1", nil)
 		rec = httptest.NewRecorder()
@@ -190,7 +191,7 @@ func TestFetchErrorMapping(t *testing.T) {
 	}
 	for i, tc := range cases {
 		id := "err-" + tc.code
-		storeResult(t, env, id, api.ResultMessage{ID: id, ErrorCode: tc.code, ErrorMessage: "boom"})
+		storeResult(t, env, defaultTenant, id, api.ResultMessage{ID: id, ErrorCode: tc.code, ErrorMessage: "boom"})
 		req := httptest.NewRequest(http.MethodGet, "/v1/requests/"+id, nil)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -239,7 +240,7 @@ func TestWaitModeReturnsResult(t *testing.T) {
 	go func() {
 		time.Sleep(300 * time.Millisecond)
 		data, _ := json.Marshal(api.ResultMessage{ID: "wait-1", StatusCode: 200, Payload: `{"waited":true}`})
-		env.rdb.LPush(t.Context(), resultKey("wait-1"), string(data))
+		env.rdb.LPush(t.Context(), resultKey(defaultTenant, "wait-1"), string(data))
 	}()
 
 	rec := post(h, "/v1/completions", `{"model":"test-model","prompt":"hi"}`,
@@ -275,6 +276,57 @@ func TestValidation(t *testing.T) {
 	rec = post(h, "/v1/chat/completions",
 		`{"model":"test-model"}`, map[string]string{"X-AP-Mode": "bogus"})
 	assert.Equal(t, http.StatusBadRequest, rec.Code, "unknown mode")
+}
+
+func TestCrossTenantFetchDenied(t *testing.T) {
+	env := newTestEnv(t, nil)
+	h := env.srv.Handler()
+
+	// team-a enqueues and its result lands.
+	rec := post(h, "/v1/completions", `{"model":"test-model","prompt":"hi"}`,
+		map[string]string{"X-AP-Mode": "enqueue", "X-Team": "team-a", "X-Request-Id": "xt-1"})
+	require.Equal(t, http.StatusAccepted, rec.Code)
+	storeResult(t, env, "team-a", "xt-1", api.ResultMessage{ID: "xt-1", StatusCode: 200, Payload: `{"secret":true}`})
+
+	// team-b (or no tenant) cannot read it.
+	req := httptest.NewRequest(http.MethodGet, "/v1/requests/xt-1", nil)
+	req.Header.Set("X-Team", "team-b")
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req)
+	assert.NotEqual(t, http.StatusOK, rec2.Code)
+	assert.NotContains(t, rec2.Body.String(), "secret")
+
+	// The owner can.
+	req = httptest.NewRequest(http.MethodGet, "/v1/requests/xt-1", nil)
+	req.Header.Set("X-Team", "team-a")
+	rec3 := httptest.NewRecorder()
+	h.ServeHTTP(rec3, req)
+	assert.Equal(t, http.StatusOK, rec3.Code)
+	assert.Contains(t, rec3.Body.String(), "secret")
+}
+
+func TestWaitModeNotifyWakeup(t *testing.T) {
+	env := newTestEnv(t, func(c *Config) { c.WaitCapSeconds = 10; c.WakeupMode = "notify" })
+	require.NotNil(t, env.srv.waiter, "notify mode should create the waiter")
+	h := env.srv.Handler()
+
+	go func() {
+		time.Sleep(250 * time.Millisecond)
+		data, _ := json.Marshal(api.ResultMessage{ID: "ntf-1", StatusCode: 200, Payload: `{"notified":true}`})
+		key := resultKey(defaultTenant, "ntf-1")
+		env.rdb.LPush(context.Background(), key, string(data))
+		// miniredis does not emit keyspace notifications; simulate the
+		// server's notification publish.
+		env.rdb.Publish(context.Background(), "__keyspace@0__:"+key, "lpush")
+	}()
+
+	start := time.Now()
+	rec := post(h, "/v1/completions", `{"model":"test-model","prompt":"hi"}`,
+		map[string]string{"X-AP-Mode": "wait", "X-Request-Id": "ntf-1"})
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.JSONEq(t, `{"notified":true}`, rec.Body.String())
+	// Woken by the notification, well before the 2s backup poll tick.
+	assert.Less(t, time.Since(start), 1500*time.Millisecond)
 }
 
 func TestPerModeTimeoutDefaults(t *testing.T) {

@@ -11,11 +11,13 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// resultKey is the per-request result destination. Messages enqueued by the
+// resultKey is the per-request result destination, scoped by tenant so that
+// fetching a result requires knowing both the tenant and the id: a caller
+// presenting the wrong tenant simply finds nothing. Messages enqueued by the
 // frontend set result_queue_name to this key, and the AP's result writer
 // delivers there. Reads are non-destructive: the key expires via its TTL.
-func resultKey(id string) string {
-	return resultKeyPrefix + id
+func resultKey(tenant, id string) string {
+	return resultKeyPrefix + tenant + ":" + id
 }
 
 // requestState is the outcome of looking up a request id.
@@ -29,9 +31,11 @@ const (
 
 // lookupResult reads a request's result without consuming it. Pending is
 // detected via the producer-maintained active-token key, which exists from
-// submit until the result is flushed.
-func lookupResult(ctx context.Context, rdb *redis.Client, id string) (requestState, *api.ResultMessage, error) {
-	vals, err := rdb.LRange(ctx, resultKey(id), 0, 0).Result()
+// submit until the result is flushed. The result read is tenant-scoped; the
+// pending check is by id only, so a caller with the wrong tenant may learn
+// that an id exists but never its result.
+func lookupResult(ctx context.Context, rdb *redis.Client, tenant, id string) (requestState, *api.ResultMessage, error) {
+	vals, err := rdb.LRange(ctx, resultKey(tenant, id), 0, 0).Result()
 	if err != nil && !errors.Is(err, redis.Nil) {
 		return stateUnknown, nil, fmt.Errorf("failed to read result: %w", err)
 	}

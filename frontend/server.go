@@ -27,11 +27,14 @@ type submitter interface {
 	SubmitRequest(ctx context.Context, req api.Request) error
 }
 
-// waitPollInterval is the degenerate wait-mode implementation for this
-// iteration: a non-destructive poll of the result key. The design's
-// multiplexed keyspace-notification wake-up replaces this behind the same
-// API in a follow-up.
+// waitPollInterval is the poll cadence when the multiplexed wake-up is
+// unavailable (Redis without keyspace notifications, or wakeupMode: poll).
 const waitPollInterval = 200 * time.Millisecond
+
+// waitBackupPollInterval is the slow safety poll under the notify wake-up:
+// keyspace notifications are fire and forget, so a lost notification is
+// recovered on the next backup tick rather than never.
+const waitBackupPollInterval = 2 * time.Second
 
 // Server is the OpenAI-compatible frontend HTTP server.
 type Server struct {
@@ -42,6 +45,7 @@ type Server struct {
 	quota   *quotaClassifier
 	logger  *slog.Logger
 	metrics *serverMetrics
+	waiter  *resultWaiter // nil = poll mode
 }
 
 // NewServer builds a Server from config, connecting to Redis and preparing
@@ -74,6 +78,22 @@ func NewServer(cfg *Config, logger *slog.Logger) (*Server, error) {
 		quota:   &quotaClassifier{rdb: rdb, cfg: cfg.Quota},
 		logger:  logger,
 		metrics: newServerMetrics(),
+	}
+
+	switch cfg.WakeupMode {
+	case "poll":
+	case "notify":
+		s.waiter = newResultWaiter(context.Background(), rdb, opts.DB, logger)
+	default: // auto
+		detectCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		enabled := notificationsEnabled(detectCtx, rdb)
+		cancel()
+		if enabled {
+			s.waiter = newResultWaiter(context.Background(), rdb, opts.DB, logger)
+			logger.Info("wait mode using keyspace-notification wake-up")
+		} else {
+			logger.Warn("Redis keyspace notifications not enabled (notify-keyspace-events needs K and l); wait mode falls back to polling")
+		}
 	}
 	s.proxy = &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -133,9 +153,16 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": models})
 }
 
+func (s *Server) tenantOf(r *http.Request) string {
+	if t := r.Header.Get(s.cfg.TenantHeader); t != "" {
+		return t
+	}
+	return defaultTenant
+}
+
 func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	state, res, err := lookupResult(r.Context(), s.rdb, id)
+	state, res, err := lookupResult(r.Context(), s.rdb, s.tenantOf(r), id)
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "api_error", "LOOKUP_FAILED", err.Error())
 		return
@@ -156,7 +183,7 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
-	if err := s.rdb.Del(r.Context(), resultKey(r.PathValue("id"))).Err(); err != nil {
+	if err := s.rdb.Del(r.Context(), resultKey(s.tenantOf(r), r.PathValue("id"))).Err(); err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "api_error", "DELETE_FAILED", err.Error())
 		return
 	}
@@ -329,7 +356,7 @@ func (s *Server) serveQueued(w http.ResponseWriter, r *http.Request, req *infere
 			Endpoint: r.URL.Path,
 		},
 		RequestQueueName: queue,
-		ResultQueueName:  resultKey(req.id),
+		ResultQueueName:  resultKey(req.tenant, req.id),
 	}
 	if err := s.sub.SubmitRequest(r.Context(), msg); err != nil {
 		s.metrics.enqueueFailures.Inc()
@@ -346,17 +373,32 @@ func (s *Server) serveQueued(w http.ResponseWriter, r *http.Request, req *infere
 }
 
 func (s *Server) waitForResult(w http.ResponseWriter, r *http.Request, req *inferenceRequest) {
-	cap := time.Duration(s.cfg.WaitCapSeconds) * time.Second
-	if req.timeout < cap {
-		cap = req.timeout
+	waitCap := time.Duration(s.cfg.WaitCapSeconds) * time.Second
+	if req.timeout < waitCap {
+		waitCap = req.timeout
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), cap)
+	ctx, cancel := context.WithTimeout(r.Context(), waitCap)
 	defer cancel()
 
-	ticker := time.NewTicker(waitPollInterval)
+	// Multiplexed wake-up: subscribe before checking so a result landing
+	// between check and park still notifies. Falls back to polling when the
+	// waiter is unavailable, or per registration error.
+	var wake <-chan struct{}
+	pollEvery := waitPollInterval
+	if s.waiter != nil {
+		if ch, cleanup, err := s.waiter.register(ctx, resultKey(req.tenant, req.id)); err == nil {
+			defer cleanup()
+			wake = ch
+			pollEvery = waitBackupPollInterval
+		} else {
+			s.logger.Warn("wake-up registration failed, polling instead", "error", err)
+		}
+	}
+
+	ticker := time.NewTicker(pollEvery)
 	defer ticker.Stop()
 	for {
-		state, res, err := lookupResult(ctx, s.rdb, req.id)
+		state, res, err := lookupResult(ctx, s.rdb, req.tenant, req.id)
 		if err == nil && state == stateReady {
 			s.metrics.waitOutcomes.WithLabelValues("result").Inc()
 			writeResult(w, res)
@@ -369,6 +411,7 @@ func (s *Server) waitForResult(w http.ResponseWriter, r *http.Request, req *infe
 			s.metrics.waitOutcomes.WithLabelValues("timeout").Inc()
 			writePending(w, req.id)
 			return
+		case <-wake:
 		case <-ticker.C:
 		}
 	}

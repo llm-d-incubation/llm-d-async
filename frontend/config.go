@@ -101,6 +101,13 @@ type Config struct {
 
 	Quota QuotaConfig `json:"quota,omitempty"`
 
+	// WakeupMode selects how wait mode learns a result has landed.
+	// "notify": multiplexed keyspace-notification wake-up (requires Redis
+	// notify-keyspace-events to include K and l). "poll": periodic
+	// non-destructive polling. "auto" (default): notify when the Redis
+	// server's config supports it, else poll.
+	WakeupMode string `json:"wakeupMode,omitempty"`
+
 	// Objectives maps tier -> objective names by classification. Stamped on
 	// direct-mode requests as ObjectiveHeader. Tiers without an entry are not
 	// stamped (the EPP then uses its default band).
@@ -182,6 +189,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Quota.WindowSeconds <= 0 {
 		c.Quota.WindowSeconds = 300
+	}
+	if c.WakeupMode == "" {
+		c.WakeupMode = "auto"
 	}
 	if c.ObjectiveHeader == "" {
 		c.ObjectiveHeader = "x-llm-d-inference-objective"
