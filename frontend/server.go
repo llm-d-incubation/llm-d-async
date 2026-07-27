@@ -35,12 +35,13 @@ const waitPollInterval = 200 * time.Millisecond
 
 // Server is the OpenAI-compatible frontend HTTP server.
 type Server struct {
-	cfg    *Config
-	rdb    *redis.Client
-	sub    submitter
-	proxy  *httputil.ReverseProxy
-	quota  *quotaClassifier
-	logger *slog.Logger
+	cfg     *Config
+	rdb     *redis.Client
+	sub     submitter
+	proxy   *httputil.ReverseProxy
+	quota   *quotaClassifier
+	logger  *slog.Logger
+	metrics *serverMetrics
 }
 
 // NewServer builds a Server from config, connecting to Redis and preparing
@@ -67,11 +68,12 @@ func NewServer(cfg *Config, logger *slog.Logger) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg:    cfg,
-		rdb:    rdb,
-		sub:    prod,
-		quota:  &quotaClassifier{rdb: rdb, cfg: cfg.Quota},
-		logger: logger,
+		cfg:     cfg,
+		rdb:     rdb,
+		sub:     prod,
+		quota:   &quotaClassifier{rdb: rdb, cfg: cfg.Quota},
+		logger:  logger,
+		metrics: newServerMetrics(),
 	}
 	s.proxy = &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -100,6 +102,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/", s.handleInference)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("GET /readyz", s.handleReady)
+	mux.Handle("GET /metrics", s.metrics.handler())
 	return mux
 }
 
@@ -139,11 +142,14 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	}
 	switch state {
 	case stateReady:
+		s.metrics.fetchTotal.WithLabelValues("ready").Inc()
 		w.Header().Set(s.cfg.RequestIDHeader, id)
 		writeResult(w, res)
 	case statePending:
+		s.metrics.fetchTotal.WithLabelValues("pending").Inc()
 		writePending(w, id)
 	default:
+		s.metrics.fetchTotal.WithLabelValues("gone").Inc()
 		writeOpenAIError(w, http.StatusGone, "invalid_request_error", "UNKNOWN_REQUEST",
 			"request id is unknown, expired, or already deleted")
 	}
@@ -218,14 +224,15 @@ func (s *Server) parseInference(r *http.Request) (*inferenceRequest, int, string
 		id = hex.EncodeToString(buf[:])
 	}
 
-	timeoutSecs := s.cfg.DefaultTimeoutSeconds
+	bounds := s.cfg.timeoutBounds(mode)
+	timeoutSecs := bounds.DefaultSeconds
 	if v := r.Header.Get(s.cfg.TimeoutHeader); v != "" {
 		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed > 0 {
 			timeoutSecs = parsed
 		}
 	}
-	if timeoutSecs > s.cfg.MaxTimeoutSeconds {
-		timeoutSecs = s.cfg.MaxTimeoutSeconds
+	if timeoutSecs > bounds.MaxSeconds {
+		timeoutSecs = bounds.MaxSeconds
 	}
 
 	return &inferenceRequest{
@@ -241,18 +248,28 @@ func (s *Server) parseInference(r *http.Request) (*inferenceRequest, int, string
 }
 
 func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	rec := &statusRecorder{ResponseWriter: w}
+
 	req, status, msg := s.parseInference(r)
 	if status != 0 {
-		writeOpenAIError(w, status, "invalid_request_error", api.ErrCodeInvalidRequest, msg)
+		s.metrics.observeRequest("invalid", status, start)
+		writeOpenAIError(rec, status, "invalid_request_error", api.ErrCodeInvalidRequest, msg)
 		return
 	}
-	w.Header().Set(s.cfg.RequestIDHeader, req.id)
+	mode := string(req.mode)
+	s.metrics.inflight.WithLabelValues(mode).Inc()
+	defer func() {
+		s.metrics.inflight.WithLabelValues(mode).Dec()
+		s.metrics.observeRequest(mode, rec.status, start)
+	}()
+	rec.Header().Set(s.cfg.RequestIDHeader, req.id)
 
 	if req.mode == ModeDirect {
-		s.serveDirect(w, r, req)
+		s.serveDirect(rec, r, req)
 		return
 	}
-	s.serveQueued(w, r, req)
+	s.serveQueued(rec, r, req)
 }
 
 // serveDirect labels the request (quota classification, objective and
@@ -263,6 +280,9 @@ func (s *Server) serveDirect(w http.ResponseWriter, r *http.Request, req *infere
 	classification, release, err := s.quota.classify(r.Context(), req.tenant)
 	if err != nil {
 		s.logger.Warn("quota classification failed open", "tenant", req.tenant, "error", err)
+		s.metrics.quotaTotal.WithLabelValues("error").Inc()
+	} else {
+		s.metrics.quotaTotal.WithLabelValues(string(classification)).Inc()
 	}
 	defer release()
 
@@ -312,6 +332,7 @@ func (s *Server) serveQueued(w http.ResponseWriter, r *http.Request, req *infere
 		ResultQueueName:  resultKey(req.id),
 	}
 	if err := s.sub.SubmitRequest(r.Context(), msg); err != nil {
+		s.metrics.enqueueFailures.Inc()
 		writeOpenAIError(w, http.StatusServiceUnavailable, "api_error", "ENQUEUE_FAILED",
 			fmt.Sprintf("failed to enqueue request: %v", err))
 		return
@@ -337,6 +358,7 @@ func (s *Server) waitForResult(w http.ResponseWriter, r *http.Request, req *infe
 	for {
 		state, res, err := lookupResult(ctx, s.rdb, req.id)
 		if err == nil && state == stateReady {
+			s.metrics.waitOutcomes.WithLabelValues("result").Inc()
 			writeResult(w, res)
 			return
 		}
@@ -344,6 +366,7 @@ func (s *Server) waitForResult(w http.ResponseWriter, r *http.Request, req *infe
 		case <-ctx.Done():
 			// Wait cap or client disconnect: fall back to the enqueue
 			// response. The request stays queued and fetchable.
+			s.metrics.waitOutcomes.WithLabelValues("timeout").Inc()
 			writePending(w, req.id)
 			return
 		case <-ticker.C:

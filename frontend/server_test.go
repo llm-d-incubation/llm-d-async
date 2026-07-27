@@ -277,6 +277,55 @@ func TestValidation(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code, "unknown mode")
 }
 
+func TestPerModeTimeoutDefaults(t *testing.T) {
+	env := newTestEnv(t, nil)
+	h := env.srv.Handler()
+
+	// Enqueue mode defaults to hour-scale deadlines.
+	rec := post(h, "/v1/completions", `{"model":"test-model","prompt":"hi"}`,
+		map[string]string{"X-AP-Mode": "enqueue", "X-Request-Id": "tmo-enq"})
+	require.Equal(t, http.StatusAccepted, rec.Code)
+	members, err := env.rdb.ZRange(t.Context(), "team-default-queue", 0, -1).Result()
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	var envlp struct {
+		Data api.RequestMessage `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(members[0]), &envlp))
+	remaining := envlp.Data.Deadline - time.Now().Unix()
+	assert.Greater(t, remaining, int64(3000), "enqueue deadline should default to hour scale")
+
+	// Enqueue max cap is per mode too: a client asking beyond it is clamped.
+	rec = post(h, "/v1/completions", `{"model":"test-model","prompt":"hi"}`,
+		map[string]string{"X-AP-Mode": "enqueue", "X-Request-Id": "tmo-enq2", "X-Request-Timeout-Seconds": "999999"})
+	require.Equal(t, http.StatusAccepted, rec.Code)
+	members, err = env.rdb.ZRange(t.Context(), "team-default-queue", 0, -1).Result()
+	require.NoError(t, err)
+	require.Len(t, members, 2)
+	require.NoError(t, json.Unmarshal([]byte(members[1]), &envlp))
+	assert.LessOrEqual(t, envlp.Data.Deadline-time.Now().Unix(), int64(86400))
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	env := newTestEnv(t, nil)
+	h := env.srv.Handler()
+
+	post(h, "/v1/completions", `{"model":"test-model","prompt":"hi"}`,
+		map[string]string{"X-AP-Mode": "enqueue"})
+	post(h, "/v1/chat/completions", `{"model":"test-model","messages":[]}`,
+		map[string]string{"X-Team": "team-a"})
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	body := rec.Body.String()
+	assert.Contains(t, body, `llm_d_async_frontend_requests_total{code="202",mode="enqueue"} 1`)
+	assert.Contains(t, body, `llm_d_async_frontend_requests_total{code="200",mode="direct"} 1`)
+	assert.Contains(t, body, `llm_d_async_frontend_quota_classifications_total{classification="reserved"} 1`)
+	assert.Contains(t, body, "llm_d_async_frontend_request_duration_seconds")
+}
+
 func TestModelsEndpoint(t *testing.T) {
 	env := newTestEnv(t, nil)
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)

@@ -41,6 +41,12 @@ type Route struct {
 	Tier   string `json:"tier,omitempty"`
 }
 
+// TimeoutBounds holds the default and maximum request deadline for a mode.
+type TimeoutBounds struct {
+	DefaultSeconds int64 `json:"defaultSeconds,omitempty"`
+	MaxSeconds     int64 `json:"maxSeconds,omitempty"`
+}
+
 // QuotaConfig configures direct-mode quota classification. It mirrors the
 // redis-quota gate's concurrency mode and key scheme so the frontend and the
 // AP's queue gates draw from the same counters. Queued modes are classified
@@ -73,8 +79,14 @@ type Config struct {
 	// X-Request-Timeout-Seconds), capped by MaxTimeoutSeconds.
 	TimeoutHeader string `json:"timeoutHeader,omitempty"`
 
+	// DefaultTimeoutSeconds and MaxTimeoutSeconds are the fallback bounds for
+	// modes without an entry in Timeouts.
 	DefaultTimeoutSeconds int64 `json:"defaultTimeoutSeconds,omitempty"`
 	MaxTimeoutSeconds     int64 `json:"maxTimeoutSeconds,omitempty"`
+	// Timeouts overrides the deadline bounds per mode. Enqueue defaults much
+	// higher than the connection-bound modes: deferred work legitimately
+	// outlives any connection.
+	Timeouts map[Mode]TimeoutBounds `json:"timeouts,omitempty"`
 	// WaitCapSeconds bounds how long ModeWait holds a connection.
 	WaitCapSeconds int64 `json:"waitCapSeconds,omitempty"`
 	// MaxBodyBytes caps request body size (default 10 MiB).
@@ -98,14 +110,29 @@ type Config struct {
 }
 
 const (
-	defaultTenant       = "default"
-	resultKeyPrefix     = "results:req:"
-	defaultListenAddr   = ":8080"
-	defaultTimeoutSecs  = 60
-	defaultMaxTimeout   = 600
-	defaultWaitCapSecs  = 55
-	defaultMaxBodyBytes = 10 << 20
+	defaultTenant            = "default"
+	resultKeyPrefix          = "results:req:"
+	defaultListenAddr        = ":8080"
+	defaultTimeoutSecs       = 60
+	defaultMaxTimeout        = 600
+	defaultEnqueueTimeout    = 3600
+	defaultEnqueueMaxTimeout = 86400
+	defaultWaitCapSecs       = 55
+	defaultMaxBodyBytes      = 10 << 20
 )
+
+// timeoutBounds resolves the deadline bounds for a mode, falling back to the
+// flat DefaultTimeoutSeconds/MaxTimeoutSeconds fields.
+func (c *Config) timeoutBounds(m Mode) TimeoutBounds {
+	b := c.Timeouts[m]
+	if b.DefaultSeconds <= 0 {
+		b.DefaultSeconds = c.DefaultTimeoutSeconds
+	}
+	if b.MaxSeconds <= 0 {
+		b.MaxSeconds = c.MaxTimeoutSeconds
+	}
+	return b
+}
 
 func (c *Config) applyDefaults() {
 	if c.ListenAddr == "" {
@@ -128,6 +155,15 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxTimeoutSeconds <= 0 {
 		c.MaxTimeoutSeconds = defaultMaxTimeout
+	}
+	if c.Timeouts == nil {
+		c.Timeouts = map[Mode]TimeoutBounds{}
+	}
+	// Enqueue mode defaults to hour-scale deadlines: nothing is holding a
+	// connection, and deferred work legitimately takes longer than any
+	// connection-bound request would.
+	if _, ok := c.Timeouts[ModeEnqueue]; !ok {
+		c.Timeouts[ModeEnqueue] = TimeoutBounds{DefaultSeconds: defaultEnqueueTimeout, MaxSeconds: defaultEnqueueMaxTimeout}
 	}
 	if c.WaitCapSeconds <= 0 {
 		c.WaitCapSeconds = defaultWaitCapSecs
