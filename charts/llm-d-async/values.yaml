@@ -248,3 +248,39 @@ ap:
     # so a single monitor can span pools that set it and pools that do not.
     # Empty disables the fallback and preserves pod-label-only behavior.
     inferencePool: ""
+
+# OpenAI API compatible frontend (optional). Serves three request modes:
+# enqueue (202 + fetch by id), wait (held connection), and direct (labeled
+# proxy to the gateway, default). See docs/openai-frontend-design.md.
+frontend:
+  enabled: false
+  replicas: 2
+  port: 8080
+  image:
+    repository: ghcr.io/llm-d/llm-d-async-frontend
+    # Leave empty to track the chart's appVersion.
+    tag: ""
+  imagePullPolicy: Always
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    capabilities:
+      drop:
+        - ALL
+  resources:
+    requests:
+      cpu: 250m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  # The frontend YAML config, rendered verbatim (required when enabled).
+  # config:
+  #   redisURL: "redis://redis:6379"
+  #   igwBaseURL: "http://gateway:80"
+  #   routes:
+  #     - model: "my-model"
+  #       queue: "team-a-queue"
+  #       tier: "interactive"
+  config: {}
