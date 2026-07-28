@@ -9,6 +9,10 @@ spec:
   selector:
     matchLabels:
       {{- toYaml .Values.ap.modelServerMonitor.selector | nindent 6 }}
+  {{- with .Values.ap.modelServerMonitor.namespaceSelector }}
+  namespaceSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   podMetricsEndpoints:
     - port: {{ .Values.ap.modelServerMonitor.port }}
       path: {{ .Values.ap.modelServerMonitor.path }}

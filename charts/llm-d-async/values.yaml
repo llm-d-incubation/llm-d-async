@@ -212,6 +212,12 @@ ap:
   # the inference_pool pod label into scraped metrics.
   # Required when using prometheus-budget or prometheus-saturation gates
   # without llm-d's flow control plugin enabled.
+  #
+  # The selector below matches model server pods in the release namespace only.
+  # If the model server runs in a different namespace than llm-d-async -- as in
+  # the llm-d guides, which deploy the model server to llm-d-optimized-baseline
+  # and llm-d-async to llm-d-async -- the monitor matches zero pods and scrapes
+  # nothing, with no error reported. Set namespaceSelector in that case.
   modelServerMonitor:
     enabled: false
     selector:
@@ -219,3 +225,13 @@ ap:
     port: modelserver
     path: /metrics
     interval: 15s
+    # Namespaces to search for model server pods. Empty means the release
+    # namespace only (prometheus-operator's default). Either list namespaces
+    # explicitly or search all of them:
+    #   namespaceSelector:
+    #     matchNames:
+    #       - llm-d-optimized-baseline
+    # or:
+    #   namespaceSelector:
+    #     any: true
+    namespaceSelector: {}

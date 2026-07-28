@@ -160,7 +160,10 @@ The values file (`docs/guides/e2e-deploy/llm-d-async-values.yaml`) configures:
 >   baseline: "0.05"
 > ```
 - `modelServerMonitor.enabled: true` — creates a PodMonitor that relabels the `inference_pool`
-  pod label into vLLM metrics (required for the dispatch budget gate fallback)
+  pod label into vLLM metrics (required for the dispatch budget gate fallback). This guide puts
+  the model server and llm-d-async in the same namespace; if yours are split, also set
+  `modelServerMonitor.namespaceSelector.matchNames` to the model server's namespace, or the
+  monitor matches no pods and scrapes nothing without reporting an error
 - `podMonitor.enabled: true` — creates a PodMonitor that scrapes the llm-d-async's own
   Prometheus metrics (retry rate, success rate, latency, etc.)
 - `prometheusRule.enabled: true` — installs alert rules for high retry rate, deadline exceeded

@@ -179,3 +179,38 @@ tests:
       - equal:
           path: spec.podMetricsEndpoints[0].path
           value: /metrics
+
+  - it: should not set a ModelServer PodMonitor namespaceSelector by default
+    templates:
+      - templates/modelserver-podmonitor.yaml
+    set:
+      ap.modelServerMonitor.enabled: true
+    asserts:
+      - notExists:
+          path: spec.namespaceSelector
+
+  - it: should scope the ModelServer PodMonitor to the given namespaces
+    templates:
+      - templates/modelserver-podmonitor.yaml
+    set:
+      ap.modelServerMonitor.enabled: true
+      ap.modelServerMonitor.namespaceSelector:
+        matchNames:
+          - llm-d-optimized-baseline
+    asserts:
+      - equal:
+          path: spec.namespaceSelector.matchNames
+          value:
+            - llm-d-optimized-baseline
+
+  - it: should let the ModelServer PodMonitor search all namespaces
+    templates:
+      - templates/modelserver-podmonitor.yaml
+    set:
+      ap.modelServerMonitor.enabled: true
+      ap.modelServerMonitor.namespaceSelector:
+        any: true
+    asserts:
+      - equal:
+          path: spec.namespaceSelector.any
+          value: true
