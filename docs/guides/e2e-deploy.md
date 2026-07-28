@@ -91,6 +91,12 @@ Pod labels serve two purposes:
 - `inference_pool: optimized-baseline` — carried into vLLM metrics via PodMonitor relabeling
   (required for the dispatch budget gate's PromQL queries)
 
+> **Using the upstream llm-d overlays instead?** They label decode pods with `llm-d.ai/*` only
+> and do not set `inference_pool`, so the relabeling produces nothing and the gate's PromQL
+> matches an empty vector, reads `NaN`, and never opens. Either add the label to your overlay as
+> the kustomization above does, or set `ap.modelServerMonitor.inferencePool` to the same value as
+> `gate_params.pool` and the chart will apply it at scrape time.
+
 Wait for the model to load:
 
 ```bash

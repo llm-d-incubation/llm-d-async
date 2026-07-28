@@ -214,3 +214,46 @@ tests:
       - equal:
           path: spec.namespaceSelector.any
           value: true
+
+  - it: should only copy the inference_pool pod label by default
+    templates:
+      - templates/modelserver-podmonitor.yaml
+    set:
+      ap.modelServerMonitor.enabled: true
+    asserts:
+      - lengthEqual:
+          path: spec.podMetricsEndpoints[0].relabelings
+          count: 1
+      - equal:
+          path: spec.podMetricsEndpoints[0].relabelings[0].sourceLabels
+          value:
+            - __meta_kubernetes_pod_label_inference_pool
+
+  - it: should fall back to the configured inference pool when pods are unlabelled
+    templates:
+      - templates/modelserver-podmonitor.yaml
+    set:
+      ap.modelServerMonitor.enabled: true
+      ap.modelServerMonitor.inferencePool: optimized-baseline
+    asserts:
+      - lengthEqual:
+          path: spec.podMetricsEndpoints[0].relabelings
+          count: 2
+      # The pod-label copy still runs first, so a labelled pod keeps its own value.
+      - equal:
+          path: spec.podMetricsEndpoints[0].relabelings[0].sourceLabels
+          value:
+            - __meta_kubernetes_pod_label_inference_pool
+      - equal:
+          path: spec.podMetricsEndpoints[0].relabelings[1].sourceLabels
+          value:
+            - inference_pool
+      - equal:
+          path: spec.podMetricsEndpoints[0].relabelings[1].regex
+          value: ^$
+      - equal:
+          path: spec.podMetricsEndpoints[0].relabelings[1].targetLabel
+          value: inference_pool
+      - equal:
+          path: spec.podMetricsEndpoints[0].relabelings[1].replacement
+          value: optimized-baseline
