@@ -191,6 +191,45 @@ func TestFlowControlQueueSizePromQL(t *testing.T) {
 	})
 }
 
+func TestPoolQueueSizePromQL(t *testing.T) {
+	promConfig := api.Config{Address: "http://localhost:9090"}
+
+	t.Run("ContainsExpectedMetrics", func(t *testing.T) {
+		source, err := NewPoolQueueSizePromQL(promConfig, "my-pool", 100, "")
+		require.NoError(t, err)
+		require.Equal(t, `1 - (avg by(name)(inference_pool_per_pod_queue_size{name="my-pool"}) / 100)`, source.expr)
+	})
+
+	t.Run("DoesNotDependOnFrozenPoolGauges", func(t *testing.T) {
+		// EPP's metrics refresh returns early at zero pods, so
+		// inference_pool_ready_pods and inference_pool_average_queue_size keep
+		// their last values and a drained pool reads as idle capacity. Averaging
+		// the scrape-time per-pod collector avoids both.
+		source, err := NewPoolQueueSizePromQL(promConfig, "my-pool", 100, "")
+		require.NoError(t, err)
+		require.NotContains(t, source.expr, "inference_pool_ready_pods")
+		require.NotContains(t, source.expr, "inference_pool_average_queue_size")
+	})
+
+	t.Run("RequiresPool", func(t *testing.T) {
+		_, err := NewPoolQueueSizePromQL(promConfig, "", 100, "")
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "inference pool name is required")
+	})
+
+	t.Run("RequiresPositiveMaxConcurrency", func(t *testing.T) {
+		_, err := NewPoolQueueSizePromQL(promConfig, "my-pool", 0, "")
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "maxConcurrency must be positive")
+	})
+
+	t.Run("WithNamespace", func(t *testing.T) {
+		source, err := NewPoolQueueSizePromQL(promConfig, "my-pool", 100, "prod")
+		require.NoError(t, err)
+		require.Contains(t, source.expr, `inference_pool_per_pod_queue_size{name="my-pool",namespace="prod"}`)
+	})
+}
+
 func TestVLLMSaturationPromQL(t *testing.T) {
 	promConfig := api.Config{Address: "http://localhost:9090"}
 

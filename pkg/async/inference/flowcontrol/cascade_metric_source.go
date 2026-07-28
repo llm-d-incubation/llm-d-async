@@ -33,7 +33,7 @@ var _ MetricSource = (*CascadeMetricSource)(nil)
 // to avoid noise during sustained outages.
 type CascadeMetricSource struct {
 	sources     []MetricSource
-	activeIndex atomic.Int32 // 0 = primary, >0 = fallback index
+	activeIndex atomic.Int32 // -1 = nothing resolved yet, 0 = primary, >0 = fallback index
 }
 
 // NewCascadeMetricSource creates a CascadeMetricSource from the given sources, tried in order.
@@ -42,7 +42,12 @@ func NewCascadeMetricSource(sources ...MetricSource) *CascadeMetricSource {
 	if len(sources) < 2 {
 		panic("CascadeMetricSource requires at least two sources")
 	}
-	return &CascadeMetricSource{sources: sources}
+	c := &CascadeMetricSource{sources: sources}
+	// Start outside the valid index range so the first query that resolves is logged.
+	// With a zero start, a cascade served by the primary from the outset looks like
+	// "no change" and never says which source the budget is coming from.
+	c.activeIndex.Store(-1)
+	return c
 }
 
 // Query implements MetricSource. It tries each source in order, logging on transitions:
@@ -55,9 +60,12 @@ func (c *CascadeMetricSource) Query(ctx context.Context) ([]Sample, error) {
 			idx := int32(i) // #nosec G115 -- i bounded by len(c.sources)
 			prev := c.activeIndex.Swap(idx)
 			if idx != prev {
-				if i == 0 {
+				switch {
+				case prev < 0:
+					logger.V(logutil.DEFAULT).Info("metric source resolved", "sourceIndex", i)
+				case i == 0:
 					logger.V(logutil.DEFAULT).Info("primary metric source recovered")
-				} else {
+				default:
 					logger.V(logutil.DEFAULT).Info("using fallback metric source",
 						"fallbackIndex", i, "previousIndex", prev)
 				}

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/go-logr/logr"
 	"github.com/llm-d/llm-d-async/api"
 	"github.com/llm-d/llm-d-async/pipeline"
 	"github.com/llm-d/llm-d-async/pkg/metrics"
@@ -96,29 +97,37 @@ func (g *MetricDispatchGate) Budget(ctx context.Context) float64 {
 
 	samples, err := g.source.Query(ctx)
 	if err != nil {
-		logger.Error(err, "MetricSource error, using fallback value", "fallback", g.fallback)
-		return g.fallback
+		return g.useFallback(logger, fmt.Errorf("MetricSource error: %w", err))
 	}
 
 	if len(samples) == 0 {
-		logger.Error(fmt.Errorf("no metric samples found"), "using fallback value", "fallback", g.fallback)
-		return g.fallback
+		return g.useFallback(logger, fmt.Errorf("no metric samples found"))
 	}
 
 	value := samples[0].Value
 	if math.IsNaN(value) || math.IsInf(value, 0) {
-		logger.Error(fmt.Errorf("invalid metric value: %v", value), "using fallback value", "fallback", g.fallback)
-		return g.fallback
+		return g.useFallback(logger, fmt.Errorf("invalid metric value: %v", value))
 	}
 
 	// Expose the raw value and threshold so operators can see why the gate is
 	// open/closed (it closes when value <= threshold).
 	metrics.SetGateMetricValue(value, g.threshold, g.owner.QueueID, g.owner.QueueName, g.owner.WorkerPoolID, g.inferencePool)
+	metrics.SetGateMetricSourceAvailable(true, g.owner.QueueID, g.owner.QueueName, g.owner.WorkerPoolID, g.inferencePool)
 
 	if value <= g.threshold {
 		return 0.0
 	}
 	return math.Min(1.0, math.Max(0.0, value-g.threshold))
+}
+
+// useFallback reports that this evaluation had no usable reading and returns the
+// configured fallback budget. Clearing async_gate_metric_source_available is what
+// lets an operator tell a fallback budget apart from a real reading of the same
+// number — most importantly a fallback of 0 from a genuinely saturated pool.
+func (g *MetricDispatchGate) useFallback(logger logr.Logger, err error) float64 {
+	metrics.SetGateMetricSourceAvailable(false, g.owner.QueueID, g.owner.QueueName, g.owner.WorkerPoolID, g.inferencePool)
+	logger.Error(err, "using fallback value", "fallback", g.fallback)
+	return g.fallback
 }
 
 // Apply implements pipeline.Gate.

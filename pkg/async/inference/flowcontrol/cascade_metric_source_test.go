@@ -37,10 +37,32 @@ func TestCascadeMetricSource_UsesPrimary(t *testing.T) {
 	secondary := &mockMetricSource{samples: []Sample{{Value: 0.3}}}
 	cascade := NewCascadeMetricSource(primary, secondary)
 
+	// Sentinel until something resolves, so a cascade served by the primary from
+	// the outset still logs which source the budget came from.
+	assert.Equal(t, int32(-1), cascade.activeIndex.Load())
+
 	samples, err := cascade.Query(context.Background())
 	require.NoError(t, err)
 	require.Len(t, samples, 1)
 	assert.Equal(t, 0.7, samples[0].Value)
+	assert.Equal(t, int32(0), cascade.activeIndex.Load())
+}
+
+func TestCascadeMetricSource_AllUnavailableLeavesIndexUnresolved(t *testing.T) {
+	primary := &switchableMetricSource{err: errors.New("primary down")}
+	secondary := &switchableMetricSource{err: errors.New("secondary down")}
+	cascade := NewCascadeMetricSource(primary, secondary)
+
+	_, err := cascade.Query(context.Background())
+	require.Error(t, err)
+	assert.Equal(t, int32(-1), cascade.activeIndex.Load(), "nothing resolved, so no active source")
+
+	// The first source to come up is reported even though it is the primary.
+	primary.set([]Sample{{Value: 0.9}}, nil)
+	samples, err := cascade.Query(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 0.9, samples[0].Value)
+	assert.Equal(t, int32(0), cascade.activeIndex.Load())
 }
 
 func TestCascadeMetricSource_FallsBackOnPrimaryError(t *testing.T) {

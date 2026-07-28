@@ -139,6 +139,57 @@ func TestMetricDispatchGate_RecordsGateMetricValue(t *testing.T) {
 	require.InDelta(t, 0.2, testutil.ToFloat64(metrics.GateMetricThreshold.WithLabelValues(labels...)), 1e-9)
 }
 
+// availableTestPool is the InferencePool label the source-available tests use; the
+// gauge carries the same label set as async_gate_metric_value so the three join.
+const availableTestPool = "optimized-baseline"
+
+func TestMetricDispatchGate_RecordsMetricSourceAvailable(t *testing.T) {
+	// A fallback budget and a real reading of the same number are otherwise
+	// indistinguishable; this gauge is what separates them.
+	tests := []struct {
+		name      string
+		source    *mockMetricSource
+		available float64
+	}{
+		{"usable reading", &mockMetricSource{samples: []Sample{{Value: 0.7}}}, 1},
+		{"query error", &mockMetricSource{err: errors.New("conn refused")}, 0},
+		{"no samples", &mockMetricSource{samples: []Sample{}}, 0},
+		{"NaN value", &mockMetricSource{samples: []Sample{{Value: math.NaN()}}}, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			owner := pipeline.GateOwner{QueueID: "q-361", QueueName: "queue-361", WorkerPoolID: "test-pool-361-" + tt.name}
+			labels := []string{owner.QueueID, owner.QueueName, owner.WorkerPoolID, availableTestPool}
+			metrics.GateMetricSourceAvailable.DeleteLabelValues(labels...)
+
+			gate := NewBudgetDispatchGate(tt.source, 0.05, 0.0).WithOwner(owner).WithInferencePool(availableTestPool)
+			_ = gate.Budget(context.Background())
+
+			require.InDelta(t, tt.available,
+				testutil.ToFloat64(metrics.GateMetricSourceAvailable.WithLabelValues(labels...)), 1e-9)
+		})
+	}
+}
+
+func TestMetricDispatchGate_MetricSourceAvailableFlipsBack(t *testing.T) {
+	owner := pipeline.GateOwner{QueueID: "q-361-recovery", QueueName: "queue-361-recovery", WorkerPoolID: "test-pool-361-recovery"}
+	labels := []string{owner.QueueID, owner.QueueName, owner.WorkerPoolID, availableTestPool}
+	metrics.GateMetricSourceAvailable.DeleteLabelValues(labels...)
+
+	source := &switchableMetricSource{err: errors.New("conn refused")}
+	gate := NewBudgetDispatchGate(source, 0.05, 0.0).WithOwner(owner).WithInferencePool(availableTestPool)
+
+	_ = gate.Budget(context.Background())
+	require.InDelta(t, 0.0,
+		testutil.ToFloat64(metrics.GateMetricSourceAvailable.WithLabelValues(labels...)), 1e-9)
+
+	source.set([]Sample{{Value: 0.7}}, nil)
+	_ = gate.Budget(context.Background())
+	require.InDelta(t, 1.0,
+		testutil.ToFloat64(metrics.GateMetricSourceAvailable.WithLabelValues(labels...)), 1e-9)
+}
+
 // switchableMetricSource allows changing what Query returns between calls.
 type switchableMetricSource struct {
 	mu      sync.Mutex

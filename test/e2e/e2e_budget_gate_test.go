@@ -17,7 +17,8 @@ const (
 
 // Budget Cascade tests run while EPP is deployed WITHOUT flow control.
 // The primary metric (inference_extension_flow_control_queue_size) is never
-// recorded, so the CascadeMetricSource falls back to vLLM metrics.
+// recorded, so the CascadeMetricSource falls past it — to EPP's per-pod queue
+// depth, or to vLLM metrics if that is empty too.
 var _ = ginkgo.Describe("Budget Cascade E2E", ginkgo.Ordered, func() {
 	var ctx context.Context
 
@@ -28,12 +29,14 @@ var _ = ginkgo.Describe("Budget Cascade E2E", ginkgo.Ordered, func() {
 		setSimWaitingRequests(simAdminURL, 0)
 	})
 
-	ginkgo.It("falls back to vLLM metrics when primary metric is unavailable", func() {
+	ginkgo.It("falls back to a later source when primary metric is unavailable", func() {
 		// EPP was deployed without flow control by BeforeSuite, so
-		// inference_extension_flow_control_queue_size is never recorded.
-		// The cascade falls back to vLLM metrics:
+		// inference_extension_flow_control_queue_size is never recorded and the
+		// cascade skips source 0. Source 1 reads EPP's per-pod queue depth:
+		//   D = 1 - (mean per-pod queue depth / max_concurrency)
+		// and if that is empty, source 2 reads vLLM metrics:
 		//   D = 1 - (running_requests / (ready_pods * max_concurrency))
-		// With sim at 0 waiting/running requests, budget is positive.
+		// With sim at 0 waiting/running requests, either gives a positive budget.
 		setSimWaitingRequests(simAdminURL, 0)
 
 		msg := makeRequestMessage("budget-cascade", 5*time.Minute)

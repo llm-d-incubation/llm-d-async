@@ -196,16 +196,17 @@ The values file (`docs/guides/e2e-deploy/llm-d-async-values.yaml`) configures:
 
 ### Size `max_concurrency` for your pool
 
-`max_concurrency` is the request capacity of **one ready pod**, not of the pool. The gate
-computes `max_SYS = ready_pods × max_concurrency` and closes only once the observed load
-reaches:
+`max_concurrency` is the request capacity of **one ready pod**, not of the pool. Every source in
+the cascade divides by it per pod — sources 0 and 2 divide pool-wide load by
+`max_SYS = ready_pods × max_concurrency`, source 1 averages per pod first — so whichever one
+resolves, the gate closes only once load reaches:
 
 ```
-ready_pods × max_concurrency × (1 - baseline)
+max_concurrency × (1 - baseline)   concurrent requests per ready pod
 ```
 
-With the values above that is `1 × 100 × 0.95` = **95 concurrent requests** against the single
-Qwen3-0.6B replica this guide deploys. That is reachable here — the saturation test below drives
+With the values above that is `100 × 0.95` = **95 concurrent requests per pod**, and this guide
+deploys a single Qwen3-0.6B replica. That is reachable here — the saturation test below drives
 200 concurrent requests, and 100 also matches the default `MaxConcurrency` of the EPP's saturation
 detector, so the async gate and the EPP agree on when the pool is full.
 
@@ -243,9 +244,13 @@ verification queries below to match.
 # All pods running
 kubectl get pods -n ${NAMESPACE}
 
-# Async processor logs should show "using fallback metric source" (vLLM saturation),
-# NOT "all metric sources unavailable"
-kubectl logs -n ${NAMESPACE} -l app.kubernetes.io/name=llm-d-async --tail=10
+# At startup, "prometheus-budget metric source" lines print the PromQL each cascade
+# source resolved to, indexed 0-2. Then "metric source resolved" reports which one
+# answered — expect sourceIndex=1 (EPP per-pod queue depth), since the llm-d router's
+# EPP does not enable the flow control plugin source 0 needs.
+# You should NOT see "all metric sources unavailable".
+kubectl logs -n ${NAMESPACE} -l app.kubernetes.io/name=llm-d-async --tail=20
+
 ```
 
 ### Verify metrics pipeline
@@ -268,8 +273,17 @@ until kubectl run --rm -i prom-wait-$RANDOM --image=curlimages/curl --restart=Ne
 done
 echo "vLLM metrics available."
 
-# Full gate budget query (should return 1.0 at idle)
+# Full gate budget query (should return 1.0 at idle). This is cascade source 1, the
+# one a stock llm-d install lands on; source 2 (vLLM) is only reached if this returns
+# nothing, and source 0 needs EPP's flow control plugin.
 kubectl run --rm -i prom-budget --image=curlimages/curl --restart=Never -n ${NAMESPACE} -- \
+    curl -s --data-urlencode \
+    'query=1 - (avg by(name)(inference_pool_per_pod_queue_size{name="optimized-baseline"}) / 100)' \
+    'http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090/api/v1/query'
+# Expected: value = 1
+
+# The vLLM fallback (source 2), which needs the relabeled inference_pool label
+kubectl run --rm -i prom-budget-vllm --image=curlimages/curl --restart=Never -n ${NAMESPACE} -- \
     curl -s --data-urlencode \
     'query=1 - (sum(vllm:num_requests_running{inference_pool="optimized-baseline"}) / on() (inference_pool_ready_pods{name="optimized-baseline"} * 100))' \
     'http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090/api/v1/query'
@@ -333,8 +347,18 @@ kubectl run --rm -i test-queued --image=redis --restart=Never -n ${NAMESPACE} --
     redis-cli -h ${REDIS_HOST} ZCARD request-sortedset
 # Expected: 1
 
-# Async processor logs should show: "using fallback value" {"fallback": 0, "error": "invalid metric value: NaN"}
+# Async processor logs should show "using fallback value" {"fallback": 0}. The accompanying
+# error depends on which source ran out last — "all metric sources unavailable" once every
+# source has gone empty, or "invalid metric value: NaN" while the vLLM source still has
+# series inside Prometheus' staleness window but ready_pods has reached zero.
 kubectl logs -n ${NAMESPACE} -l app.kubernetes.io/name=llm-d-async --tail=5
+
+# The same thing as a metric: 0 means the budget below is the configured fallback,
+# not a reading. (1 would mean the pool really is reporting no capacity.)
+kubectl run --rm -i prom-gate-src --image=curlimages/curl --restart=Never -n ${NAMESPACE} -- \
+    curl -s --data-urlencode 'query=llm_d_async_async_gate_metric_source_available' \
+    'http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090/api/v1/query'
+# Expected: value = 0 while the pool is scaled down
 
 # Scale back up — gate opens, queued request gets dispatched
 kubectl scale deployment vllm-qwen3-0-6b-decode -n ${NAMESPACE} --replicas=1

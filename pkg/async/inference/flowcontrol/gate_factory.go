@@ -22,11 +22,11 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/llm-d/llm-d-async/pipeline"
 	redisgate "github.com/llm-d/llm-d-async/pkg/redis"
 	promapi "github.com/prometheus/client_golang/api"
 	goredis "github.com/redis/go-redis/v9"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // DefaultCacheTTL is the default TTL for cached Prometheus metric sources.
@@ -39,6 +39,7 @@ type GateFactory struct {
 	prometheusURL string
 	cacheTTL      time.Duration
 	redisClients  map[string]*goredis.Client
+	logger        logr.Logger
 }
 
 // NewGateFactory creates a new GateFactory with an optional Prometheus URL.
@@ -56,7 +57,17 @@ func NewGateFactoryWithCacheTTL(prometheusURL string, cacheTTL time.Duration) *G
 		prometheusURL: prometheusURL,
 		cacheTTL:      cacheTTL,
 		redisClients:  make(map[string]*goredis.Client),
+		logger:        logr.Discard(),
 	}
+}
+
+// WithLogger sets the logger the factory uses to report the PromQL each Prometheus
+// gate resolved to. Gates build their queries from gate_params rather than taking
+// them verbatim, so without this the only way to find out what is actually being
+// asked of Prometheus is to read the source.
+func (f *GateFactory) WithLogger(logger logr.Logger) *GateFactory {
+	f.logger = logger
+	return f
 }
 
 // Close closes all Redis clients created by this factory.
@@ -77,14 +88,18 @@ func (f *GateFactory) Close() error {
 //   - "prometheus-saturation": Queries Prometheus for pool saturation metric.
 //     Params: pool (required), threshold (default 0.8), fallback (default 0.0)
 //   - "composite": Combines multiple gates. Params: gates (JSON array of gate configurations)
-//   - "prometheus-budget": Cascades two Prometheus metric sources to compute dispatch budget D.
-//     Both sources compute max_SYS = ready_pods × max_concurrency dynamically.
-//     Primary: D = 1 − (queue_size / max_SYS) via inference_extension_flow_control_queue_size.
-//     Secondary (fallback): D = 1 − (vllm_running / max_SYS).
-//     The primary source requires llm-d's flow control plugin to be enabled.
-//     The fallback filters vLLM metrics by inference_pool label, which vLLM does not
-//     emit natively — model server pods must carry this label and Prometheus must be
-//     configured with metric relabeling to propagate it (see docs/guides/e2e-deploy.md).
+//   - "prometheus-budget": Cascades three Prometheus metric sources to compute dispatch budget D,
+//     using the first that returns a sample.
+//     [0] D = 1 − (queue_size / max_SYS) via inference_extension_flow_control_queue_size.
+//     Requires llm-d's flow control plugin, which the llm-d router does not enable.
+//     [1] D = 1 − (mean per-pod queue depth / max_concurrency) via inference_pool_per_pod_queue_size.
+//     Part of EPP's base metric set, so this is the source a stock install lands on.
+//     [2] D = 1 − (vllm_running / max_SYS). Filters vLLM metrics by inference_pool label,
+//     which vLLM does not emit natively — model server pods must carry this label and
+//     Prometheus must be configured with metric relabeling to propagate it
+//     (see docs/guides/e2e-deploy.md).
+//     Sources [0] and [2] compute max_SYS = ready_pods × max_concurrency dynamically; [1] averages
+//     over pods, in which the ready_pods factor cancels.
 //     Gate closes when D ≤ B (baseline); returns D − B when open, so callers compute
 //     N = max_SYS × (D − B). Params: pool (required),
 //     max_concurrency (default 100), baseline (default 0.05), fallback (default 0.0)
@@ -233,6 +248,8 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 		if err != nil {
 			return nil, err
 		}
+		f.logger.Info("prometheus-saturation metric source",
+			"pool", paramString(params, "pool", ""), "query", source.Expr())
 		var ms MetricSource = source
 		if f.cacheTTL > 0 {
 			ms = NewCachedMetricSource(source, f.cacheTTL)
@@ -272,25 +289,34 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 		promConfig := promapi.Config{Address: f.prometheusURL}
 		namespace := paramString(params, "namespace", "")
 
-		primary, err := NewFlowControlQueueSizePromQL(promConfig, pool, maxConcurrency, namespace)
+		flowControlSource, err := NewFlowControlQueueSizePromQL(promConfig, pool, maxConcurrency, namespace)
 		if err != nil {
 			return nil, err
 		}
-		secondary, err := NewVLLMSaturationPromQL(promConfig, pool, maxConcurrency, namespace)
+		poolQueueSource, err := NewPoolQueueSizePromQL(promConfig, pool, maxConcurrency, namespace)
+		if err != nil {
+			return nil, err
+		}
+		vllmSource, err := NewVLLMSaturationPromQL(promConfig, pool, maxConcurrency, namespace)
 		if err != nil {
 			return nil, err
 		}
 
-		var ms MetricSource = NewCascadeMetricSource(
-			cachedSource(primary, f.cacheTTL),
-			cachedSource(secondary, f.cacheTTL),
-		)
+		sources := []*PromQLMetricSource{flowControlSource, poolQueueSource, vllmSource}
+		cascaded := make([]MetricSource, 0, len(sources))
+		for i, s := range sources {
+			f.logger.Info("prometheus-budget metric source",
+				"pool", pool, "sourceIndex", i, "query", s.Expr())
+			cascaded = append(cascaded, cachedSource(s, f.cacheTTL))
+		}
 
-		// Report the resolved closing point. max_concurrency is a per-ready-pod
-		// divisor, so a value the pool can never reach leaves the gate
-		// permanently open with nothing in the logs or metrics to say so.
+		var ms MetricSource = NewCascadeMetricSource(cascaded...)
+
+		// Report the resolved closing point. Every source in the cascade divides
+		// by max_concurrency per pod, so a value the pool can never reach leaves
+		// the gate permanently open with nothing in the logs or metrics to say so.
 		// Surfacing it here makes a mis-sized max_concurrency visible at startup.
-		log.Log.WithName("gate-factory").Info("prometheus-budget gate configured",
+		f.logger.Info("prometheus-budget gate configured",
 			"pool", pool,
 			"maxConcurrency", maxConcurrency,
 			"baseline", baseline,

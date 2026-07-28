@@ -93,7 +93,8 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 		return err
 	}
 
-	gateFactory = flowcontrol.NewGateFactoryWithCacheTTL(opts.Prometheus.URL, opts.Prometheus.CacheTTL)
+	gateFactory = flowcontrol.NewGateFactoryWithCacheTTL(opts.Prometheus.URL, opts.Prometheus.CacheTTL).
+		WithLogger(setupLog)
 
 	policy, err := loadRequestMergePolicy(opts.Queue.MergePolicyConfigFile, ctx)
 	if err != nil {

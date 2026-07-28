@@ -18,11 +18,14 @@ package flowcontrol
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
 	"github.com/llm-d/llm-d-async/pipeline"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestGateFactory_WithCacheTTL(t *testing.T) {
@@ -249,6 +252,70 @@ func TestGateFactory_BudgetGateWithAllParams(t *testing.T) {
 	}})
 	assert.NoError(t, err)
 	assert.NotNil(t, gate)
+}
+
+func TestGateFactory_BudgetGateCascadeSources(t *testing.T) {
+	factory := NewGateFactory("http://localhost:9090")
+	gate, err := factory.CreateGate(pipeline.GateConfig{GateType: "prometheus-budget", GateParams: map[string]any{
+		"pool":            "my-pool",
+		"max_concurrency": 100.0,
+	}})
+	require.NoError(t, err)
+
+	metricGate, ok := gate.(*MetricDispatchGate)
+	require.True(t, ok)
+	cascade, ok := metricGate.source.(*CascadeMetricSource)
+	require.True(t, ok)
+	require.Len(t, cascade.sources, 3)
+
+	exprs := make([]string, len(cascade.sources))
+	for i, s := range cascade.sources {
+		cached, ok := s.(*CachedMetricSource)
+		require.True(t, ok)
+		promSource, ok := cached.source.(*PromQLMetricSource)
+		require.True(t, ok)
+		exprs[i] = promSource.expr
+	}
+
+	// Flow control stays first for installs that enable the plugin; the metric a
+	// stock EPP always exports is next, so the cascade resolves without it; vLLM
+	// last because it needs scrape-time relabeling to carry inference_pool.
+	assert.Contains(t, exprs[0], "inference_extension_flow_control_queue_size")
+	assert.Contains(t, exprs[1], "inference_pool_per_pod_queue_size")
+	assert.Contains(t, exprs[2], "vllm:num_requests_running")
+}
+
+func TestGateFactory_BudgetGateLogsResolvedQueries(t *testing.T) {
+	var logged []string
+	logger := funcr.New(func(_, args string) { logged = append(logged, args) }, funcr.Options{})
+
+	factory := NewGateFactory("http://localhost:9090").WithLogger(logger)
+	_, err := factory.CreateGate(pipeline.GateConfig{GateType: "prometheus-budget", GateParams: map[string]any{
+		"pool": "my-pool",
+	}})
+	require.NoError(t, err)
+
+	joined := strings.Join(logged, "\n")
+	assert.Contains(t, joined, "inference_extension_flow_control_queue_size")
+	assert.Contains(t, joined, "inference_pool_per_pod_queue_size")
+	assert.Contains(t, joined, "vllm:num_requests_running")
+
+	// The resolved closing point goes to the same logger as the source queries.
+	assert.Contains(t, joined, "prometheus-budget gate configured")
+	assert.Contains(t, joined, "closesAtLoadPerReadyPod")
+}
+
+func TestGateFactory_SaturationGateLogsResolvedQuery(t *testing.T) {
+	var logged []string
+	logger := funcr.New(func(_, args string) { logged = append(logged, args) }, funcr.Options{})
+
+	factory := NewGateFactory("http://localhost:9090").WithLogger(logger)
+	_, err := factory.CreateGate(pipeline.GateConfig{GateType: "prometheus-saturation", GateParams: map[string]any{
+		"pool": "my-pool",
+	}})
+	require.NoError(t, err)
+
+	assert.Contains(t, strings.Join(logged, "\n"), "inference_extension_flow_control_pool_saturation")
 }
 
 func TestGateFactory_PrometheusQueryGateWithoutURL(t *testing.T) {

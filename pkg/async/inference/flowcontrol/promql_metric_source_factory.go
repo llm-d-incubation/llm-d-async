@@ -81,6 +81,49 @@ func NewFlowControlQueueSizePromQL(promConfig promapi.Config, inferencePool stri
 	return source, nil
 }
 
+// NewPoolQueueSizePromQL builds a PromQLMetricSource that returns the model server queue depth
+// EPP reports per pod as a dispatch budget D = 1 − (mean per-pod queue depth / maxConcurrency).
+//
+// inference_extension_flow_control_queue_size is only recorded when EPP runs the flow control
+// plugin, which the llm-d router does not enable. inference_pool_per_pod_queue_size is part of
+// EPP's base metric set, so this source resolves on a stock install.
+//
+// Averaging over pods is what makes max_SYS = ready_pods × maxConcurrency reduce to
+// maxConcurrency, so this needs no inference_pool_ready_pods join. That matters for more than
+// brevity: EPP's metrics refresh returns early when the pool has no pods, freezing
+// inference_pool_ready_pods (and inference_pool_average_queue_size, which is why that metric is
+// not used here) at their last values. A drained pool would then read as idle capacity.
+// inference_pool_per_pod_queue_size is emitted by a scrape-time collector instead, so it simply
+// stops reporting — the query yields no samples and the cascade moves on rather than opening
+// the gate onto a pool with nothing behind it.
+//
+// avg is sum/count over the per-pod series, so the result does not change when several EPP
+// replicas each report the same pods. EPP labels its inference_pool_* series with "name", not
+// "inference_pool" (the same label inference_pool_ready_pods uses above).
+// inferencePool and maxConcurrency are required.
+func NewPoolQueueSizePromQL(promConfig promapi.Config, inferencePool string, maxConcurrency float64, namespace string) (*PromQLMetricSource, error) {
+	if inferencePool == "" {
+		return nil, fmt.Errorf("inference pool name is required for pool queue size PromQL")
+	}
+	if maxConcurrency <= 0 {
+		return nil, fmt.Errorf("maxConcurrency must be positive, got %g", maxConcurrency)
+	}
+	queueLabels := map[string]string{"name": inferencePool}
+	if namespace != "" {
+		queueLabels["namespace"] = namespace
+	}
+	query := fmt.Sprintf(
+		`1 - (avg by(name)(%s) / %g)`,
+		buildPromQL("inference_pool_per_pod_queue_size", queueLabels),
+		maxConcurrency,
+	)
+	source, err := NewPromQLMetricSource(promConfig, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Prometheus metric source: %w", err)
+	}
+	return source, nil
+}
+
 // NewVLLMSaturationPromQL builds a PromQLMetricSource that estimates inference pool saturation
 // from vLLM and pool metrics, returning D = 1 − (running_requests / (ready_pods × maxConcurrency)).
 // This serves as a fallback when EPP flow control metrics are unavailable.

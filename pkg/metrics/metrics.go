@@ -122,6 +122,10 @@ var (
 		Subsystem: SchedulerSubsystem, Name: "async_gate_metric_threshold",
 		Help: "Threshold a metric-based dispatch gate compares async_gate_metric_value against; the gate closes when value <= this threshold.",
 	}, gateLabels)
+	GateMetricSourceAvailable = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Subsystem: SchedulerSubsystem, Name: "async_gate_metric_source_available",
+		Help: "1 when a metric-based dispatch gate's last evaluation got a usable reading from its metric source, 0 when it fell back to the configured 'fallback' budget (query error, no samples, or NaN/Inf). Distinguishes a fallback budget from a real reading of the same number: async_dispatch_budget 0 with this at 1 means a saturated pool, at 0 means unreadable metrics. async_gate_metric_value is stale whenever this is 0.",
+	}, gateLabels)
 )
 
 // Gate decision reason label values for async_gate_decisions_total.
@@ -223,13 +227,25 @@ func SetGateMetricValue(value, threshold float64, queueID, queueName, poolName, 
 	GateMetricThreshold.WithLabelValues(queueID, queueName, poolName, inferencePool).Set(threshold)
 }
 
+// SetGateMetricSourceAvailable records whether a metric-based dispatch gate's last
+// evaluation obtained a usable reading. Helps answer "is this budget a real
+// measurement or the configured fallback?". Carries the same labels as
+// SetGateMetricValue so the three series join.
+func SetGateMetricSourceAvailable(available bool, queueID, queueName, poolName, inferencePool string) {
+	v := 0.0
+	if available {
+		v = 1.0
+	}
+	GateMetricSourceAvailable.WithLabelValues(queueID, queueName, poolName, inferencePool).Set(v)
+}
+
 // GetCollectors returns all custom collectors for the async processor.
 func GetAsyncProcessorCollectors(supportsMessageLatency bool) []prometheus.Collector {
 	collectors := []prometheus.Collector{
 		Retries, AsyncReqs, ExceededDeadlineReqs, FailedReqs, SuccessfulReqs, SheddedRequests,
 		QueueDepth, InflightRequests, BrokerBacklog, InferenceLatencyTime, QueueResidenceTime,
 		DispatchBudget, PoolWorkerLimit, GateDecisions,
-		GateMetricValue, GateMetricThreshold,
+		GateMetricValue, GateMetricThreshold, GateMetricSourceAvailable,
 	}
 	if supportsMessageLatency {
 		collectors = append(collectors, MessageLatencyTime)
