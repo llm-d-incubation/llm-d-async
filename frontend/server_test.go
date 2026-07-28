@@ -476,3 +476,22 @@ func TestQueuedModeForwardsAllowlistedHeaders(t *testing.T) {
 	_, leaked := envlp.Data.Headers["X-Custom-Secret"]
 	assert.False(t, leaked, "non-allowlisted headers must not forward")
 }
+
+func TestDirectModeStripsClientIdentityHeaders(t *testing.T) {
+	// Route the request to a tier with no objectives mapping: the client's
+	// self-assigned objective must still be stripped, not passed through.
+	env := newTestEnv(t, func(c *Config) {
+		c.Routes = []Route{{Model: "test-model", Queue: "q", Tier: "unmapped-tier"}}
+	})
+	rec := post(env.srv.Handler(), "/v1/chat/completions",
+		`{"model":"test-model","messages":[]}`,
+		map[string]string{
+			"X-Team":                        "team-a",
+			"x-llm-d-inference-objective":   "sneaky-priority",
+			"x-llm-d-inference-fairness-id": "someone-else",
+		})
+	require.Equal(t, http.StatusOK, rec.Code)
+	backendReq := <-env.seen
+	assert.Empty(t, backendReq.Header.Get("x-llm-d-inference-objective"))
+	assert.Equal(t, "team-a", backendReq.Header.Get("x-llm-d-inference-fairness-id"))
+}

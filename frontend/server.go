@@ -322,6 +322,11 @@ func (s *Server) serveDirect(w http.ResponseWriter, r *http.Request, req *infere
 	out := r.Clone(ctx)
 	out.Body = io.NopCloser(bytes.NewReader(req.body))
 	out.ContentLength = int64(len(req.body))
+	// Identity headers are frontend-owned: strip client-supplied values
+	// unconditionally so priority cannot be self-assigned, even for tiers
+	// without a configured objective mapping.
+	out.Header.Del(s.cfg.ObjectiveHeader)
+	out.Header.Del(s.cfg.FairnessHeader)
 	if pair, ok := s.cfg.Objectives[tier]; ok {
 		objective := pair.Reserved
 		if classification == ClassificationOverflow {
