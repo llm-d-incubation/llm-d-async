@@ -92,6 +92,10 @@ func writeResult(w http.ResponseWriter, res *api.ResultMessage) {
 		writeOpenAIError(w, http.StatusGatewayTimeout, "timeout_error", res.ErrorCode, res.ErrorMessage)
 	case api.ErrCodeInvalidRequest:
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", res.ErrorCode, res.ErrorMessage)
+	case api.ErrCodeCancelled:
+		// 499 Client Closed Request (nginx convention): the caller abandoned
+		// the request and cancellation dropped it pre-dispatch.
+		writeOpenAIError(w, 499, "cancelled", res.ErrorCode, res.ErrorMessage)
 	default:
 		writeOpenAIError(w, http.StatusBadGateway, "api_error", res.ErrorCode, res.ErrorMessage)
 	}

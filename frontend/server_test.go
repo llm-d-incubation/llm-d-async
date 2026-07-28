@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -385,4 +386,71 @@ func TestModelsEndpoint(t *testing.T) {
 	env.srv.Handler().ServeHTTP(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Contains(t, rec.Body.String(), "test-model")
+}
+
+func TestCancelledErrorMapsTo499(t *testing.T) {
+	env := newTestEnv(t, nil)
+	storeResult(t, env, defaultTenant, "cx-1", api.ResultMessage{ID: "cx-1", ErrorCode: api.ErrCodeCancelled, ErrorMessage: "cancelled"})
+	req := httptest.NewRequest(http.MethodGet, "/v1/requests/cx-1", nil)
+	rec := httptest.NewRecorder()
+	env.srv.Handler().ServeHTTP(rec, req)
+	assert.Equal(t, 499, rec.Code)
+}
+
+func TestWaitModeDisconnectCancels(t *testing.T) {
+	env := newTestEnv(t, func(c *Config) { c.WaitCapSeconds = 30 })
+	rec := &recordingSubmitter{inner: env.srv.sub}
+	env.srv.sub = rec
+
+	// A request context that dies shortly after enqueue simulates a client
+	// disconnect while waiting.
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/v1/completions",
+		strings.NewReader(`{"model":"test-model","prompt":"hi"}`)).WithContext(ctx)
+	req.Header.Set("X-AP-Mode", "wait")
+	req.Header.Set("X-Request-Id", "gone-1")
+	go func() { time.Sleep(300 * time.Millisecond); cancel() }()
+
+	w := httptest.NewRecorder()
+	env.srv.Handler().ServeHTTP(w, req)
+
+	deadline := time.After(3 * time.Second)
+	for {
+		if rec.cancelled("gone-1") {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("expected CancelRequests for abandoned wait request")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+type recordingSubmitter struct {
+	inner submitter
+	mu    sync.Mutex
+	ids   []string
+}
+
+func (r *recordingSubmitter) SubmitRequest(ctx context.Context, req api.Request) error {
+	return r.inner.SubmitRequest(ctx, req)
+}
+
+func (r *recordingSubmitter) CancelRequests(ctx context.Context, ids []string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ids = append(r.ids, ids...)
+	return r.inner.CancelRequests(ctx, ids)
+}
+
+func (r *recordingSubmitter) cancelled(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, v := range r.ids {
+		if v == id {
+			return true
+		}
+	}
+	return false
 }

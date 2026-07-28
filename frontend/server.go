@@ -25,6 +25,7 @@ import (
 // submitter is the subset of producer.Producer the server needs.
 type submitter interface {
 	SubmitRequest(ctx context.Context, req api.Request) error
+	CancelRequests(ctx context.Context, requestIDs []string) error
 }
 
 // waitPollInterval is the poll cadence when the multiplexed wake-up is
@@ -406,8 +407,21 @@ func (s *Server) waitForResult(w http.ResponseWriter, r *http.Request, req *infe
 		}
 		select {
 		case <-ctx.Done():
-			// Wait cap or client disconnect: fall back to the enqueue
-			// response. The request stays queued and fetchable.
+			if r.Context().Err() != nil {
+				// Client disconnected: nobody will fetch this result, so
+				// cancel pre-dispatch (best effort, per the producer's
+				// cancellation contract). A client retry with the same id
+				// re-submits cleanly: SubmitRequest clears stale markers.
+				s.metrics.waitOutcomes.WithLabelValues("cancelled").Inc()
+				cancelCtx, cancelFn := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancelFn()
+				if err := s.sub.CancelRequests(cancelCtx, []string{req.id}); err != nil {
+					s.logger.Warn("failed to cancel abandoned request", "id", req.id, "error", err)
+				}
+				return
+			}
+			// Wait cap reached with the client still connected: fall back to
+			// the enqueue response. The request stays queued and fetchable.
 			s.metrics.waitOutcomes.WithLabelValues("timeout").Inc()
 			writePending(w, req.id)
 			return
