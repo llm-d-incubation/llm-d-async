@@ -346,6 +346,15 @@ func (s *Server) serveQueued(w http.ResponseWriter, r *http.Request, req *infere
 	if tp := r.Header.Get("traceparent"); tp != "" {
 		metadata["traceparent"] = tp
 	}
+	var fwd map[string]string
+	for _, h := range s.cfg.ForwardHeaders {
+		if v := r.Header.Get(h); v != "" {
+			if fwd == nil {
+				fwd = map[string]string{}
+			}
+			fwd[h] = v
+		}
+	}
 
 	msg := &api.RedisRequest{
 		RequestMessage: api.RequestMessage{
@@ -354,6 +363,7 @@ func (s *Server) serveQueued(w http.ResponseWriter, r *http.Request, req *infere
 			Deadline: now.Add(req.timeout).Unix(),
 			Payload:  req.payload,
 			Metadata: metadata,
+			Headers:  fwd,
 			Endpoint: r.URL.Path,
 		},
 		RequestQueueName: queue,

@@ -454,3 +454,25 @@ func (r *recordingSubmitter) cancelled(id string) bool {
 	}
 	return false
 }
+
+func TestQueuedModeForwardsAllowlistedHeaders(t *testing.T) {
+	env := newTestEnv(t, nil)
+	rec := post(env.srv.Handler(), "/v1/completions", `{"model":"test-model","prompt":"hi"}`,
+		map[string]string{
+			"X-AP-Mode":           "enqueue",
+			"X-Request-Id":        "hdr-1",
+			"x-llm-d-slo-ttft-ms": "800",
+			"X-Custom-Secret":     "should-not-forward",
+		})
+	require.Equal(t, http.StatusAccepted, rec.Code)
+	members, err := env.rdb.ZRange(t.Context(), "team-default-queue", 0, -1).Result()
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	var envlp struct {
+		Data api.RequestMessage `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(members[0]), &envlp))
+	assert.Equal(t, "800", envlp.Data.Headers["x-llm-d-slo-ttft-ms"])
+	_, leaked := envlp.Data.Headers["X-Custom-Secret"]
+	assert.False(t, leaked, "non-allowlisted headers must not forward")
+}

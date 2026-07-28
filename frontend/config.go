@@ -101,6 +101,13 @@ type Config struct {
 
 	Quota QuotaConfig `json:"quota,omitempty"`
 
+	// ForwardHeaders lists client headers copied onto queued messages and
+	// forwarded at dispatch (direct mode forwards all headers natively).
+	// Defaults to the gateway SLO ordering headers. Identity headers
+	// (objective, fairness) are always stamped by the frontend and cannot be
+	// forwarded from clients.
+	ForwardHeaders []string `json:"forwardHeaders,omitempty"`
+
 	// WakeupMode selects how wait mode learns a result has landed.
 	// "notify": multiplexed keyspace-notification wake-up (requires Redis
 	// notify-keyspace-events to include K and l). "poll": periodic
@@ -192,6 +199,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.WakeupMode == "" {
 		c.WakeupMode = "auto"
+	}
+	if c.ForwardHeaders == nil {
+		c.ForwardHeaders = []string{"x-llm-d-slo-ttft-ms", "x-llm-d-slo-tpot-ms"}
 	}
 	if c.ObjectiveHeader == "" {
 		c.ObjectiveHeader = "x-llm-d-inference-objective"
