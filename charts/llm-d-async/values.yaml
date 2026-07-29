@@ -251,7 +251,8 @@ ap:
 
 # OpenAI API compatible frontend (optional). Serves three request modes:
 # enqueue (202 + fetch by id), wait (held connection), and direct (labeled
-# proxy to the gateway, default). See docs/openai-frontend-design.md.
+# proxy to the gateway). Requests without a mode header get the config's
+# defaultMode (direct when unset). See docs/openai-frontend-design.md.
 frontend:
   enabled: false
   replicas: 2
@@ -276,9 +277,12 @@ frontend:
       cpu: "1"
       memory: 512Mi
   # The frontend YAML config, rendered verbatim (required when enabled).
+  # Set defaultMode explicitly so the deployment's bare-request behavior is
+  # visible in the ConfigMap rather than implied by absence.
   # config:
   #   redisURL: "redis://redis:6379"
   #   igwBaseURL: "http://gateway:80"
+  #   defaultMode: direct  # direct | enqueue | wait, per-request header wins
   #   routes:
   #     - model: "my-model"
   #       queue: "team-a-queue"

@@ -1,7 +1,8 @@
 // Package frontend implements an OpenAI API compatible HTTP frontend for the
-// async processor. It serves three modes selected per request by header:
-// enqueue (202 + fetch later), wait (hold the connection until the result
-// lands), and direct (label and proxy straight to the inference gateway).
+// async processor. It serves three modes selected per request by header, with
+// a configurable default for requests that carry none: enqueue (202 + fetch
+// later), wait (hold the connection until the result lands), and direct
+// (label and proxy straight to the inference gateway).
 // See docs/openai-frontend-design.md.
 package frontend
 
@@ -71,8 +72,13 @@ type Config struct {
 
 	// TenantHeader names the header carrying the tenant key (default X-Team).
 	TenantHeader string `json:"tenantHeader,omitempty"`
-	// ModeHeader selects the serving mode (default X-AP-Mode; absent = direct).
+	// ModeHeader selects the serving mode per request (default X-AP-Mode). A
+	// request without the header is served in DefaultMode.
 	ModeHeader string `json:"modeHeader,omitempty"`
+	// DefaultMode serves requests that carry no mode header (default direct,
+	// so a stock SDK pointed at the frontend behaves like the gateway).
+	// Unrecognized values fail startup rather than silently falling back.
+	DefaultMode Mode `json:"defaultMode,omitempty"`
 	// RequestIDHeader lets clients supply their own request id (default X-Request-Id).
 	RequestIDHeader string `json:"requestIDHeader,omitempty"`
 	// TimeoutHeader lets clients request a deadline in seconds (default
@@ -158,6 +164,9 @@ func (c *Config) applyDefaults() {
 	if c.ModeHeader == "" {
 		c.ModeHeader = "X-AP-Mode"
 	}
+	if c.DefaultMode == "" {
+		c.DefaultMode = ModeDirect
+	}
 	if c.RequestIDHeader == "" {
 		c.RequestIDHeader = "X-Request-Id"
 	}
@@ -217,6 +226,11 @@ func (c *Config) validate() error {
 	}
 	if c.IGWBaseURL == "" {
 		return fmt.Errorf("igwBaseURL is required")
+	}
+	switch c.DefaultMode {
+	case ModeDirect, ModeEnqueue, ModeWait:
+	default:
+		return fmt.Errorf("defaultMode must be %q, %q, or %q, got %q", ModeDirect, ModeEnqueue, ModeWait, c.DefaultMode)
 	}
 	return nil
 }

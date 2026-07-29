@@ -224,9 +224,11 @@ func (s *Server) parseInference(r *http.Request) (*inferenceRequest, int, string
 	}
 	stream, _ := payload["stream"].(bool)
 
-	mode := ModeDirect
+	mode := s.cfg.DefaultMode
 	switch strings.ToLower(r.Header.Get(s.cfg.ModeHeader)) {
-	case "", string(ModeDirect):
+	case "":
+	case string(ModeDirect):
+		mode = ModeDirect
 	case string(ModeEnqueue):
 		mode = ModeEnqueue
 	case string(ModeWait):

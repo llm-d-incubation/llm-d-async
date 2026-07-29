@@ -279,6 +279,39 @@ func TestValidation(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code, "unknown mode")
 }
 
+func TestConfiguredDefaultMode(t *testing.T) {
+	env := newTestEnv(t, func(c *Config) { c.DefaultMode = ModeEnqueue })
+	h := env.srv.Handler()
+
+	// A bare POST rides the configured default: enqueued, not proxied.
+	rec := post(h, "/v1/chat/completions", `{"model":"test-model","messages":[]}`,
+		map[string]string{"X-Team": "team-a"})
+	require.Equal(t, http.StatusAccepted, rec.Code, rec.Body.String())
+	assert.Contains(t, rec.Body.String(), "pending")
+	members, err := env.rdb.ZRange(t.Context(), "team-default-queue", 0, -1).Result()
+	require.NoError(t, err)
+	assert.Len(t, members, 1)
+
+	// The per-request header wins over the configured default.
+	rec = post(h, "/v1/chat/completions", `{"model":"test-model","messages":[]}`,
+		map[string]string{"X-Team": "team-a", "X-AP-Mode": "direct"})
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.Contains(t, rec.Body.String(), `"backend":true`)
+}
+
+func TestDefaultModeValidation(t *testing.T) {
+	cfg := &Config{RedisURL: "redis://x", IGWBaseURL: "http://x", DefaultMode: "bogus"}
+	cfg.applyDefaults()
+	err := cfg.validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "defaultMode")
+
+	cfg.DefaultMode = ""
+	cfg.applyDefaults()
+	assert.Equal(t, ModeDirect, cfg.DefaultMode)
+	require.NoError(t, cfg.validate())
+}
+
 func TestCrossTenantFetchDenied(t *testing.T) {
 	env := newTestEnv(t, nil)
 	h := env.srv.Handler()
