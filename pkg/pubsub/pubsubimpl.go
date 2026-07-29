@@ -181,8 +181,15 @@ func NewGCPPubSubMQFlow(pubsubOpts Options, fns ...PubSubOption) (*PubSubMQFlow,
 		// Determine gate for this topic
 		var gate pipeline.Gate
 		if p.gateFactory != nil && cfg.GateType != "" {
-			// Use factory to create per-topic gate
-			gate, err = p.gateFactory.CreateGate(cfg.GateConfig)
+			// Use factory to create per-topic gate. The subscriber ID is what the
+			// rest of this backend's metrics use as queue_name (there is no
+			// separate queue ID), so the gate's own gauges join with them.
+			gateCfg := cfg.GateConfig
+			gateCfg.Owner = pipeline.GateOwner{
+				QueueName:    cfg.SubscriberID,
+				WorkerPoolID: workerPoolID,
+			}
+			gate, err = p.gateFactory.CreateGate(gateCfg)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create gate for topic subscriber %q (gate_type=%q): %w", cfg.SubscriberID, cfg.GateType, err)
 			}

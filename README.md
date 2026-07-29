@@ -314,6 +314,9 @@ For more fine-grained control, configure gates per queue in your configuration f
     The result is used directly as the dispatch budget (no transformation is applied).
   - `fallback` (optional): Fallback budget value (0.0-1.0) returned when the query fails or returns no data.
     Default is `0.0` (fail closed).
+  - `pool` (optional): The InferencePool the query is about. Purely descriptive — it does not
+    affect the query, it only sets the `inference_pool` label on `async_gate_metric_value` and
+    `async_gate_metric_threshold` so you can tell which pool a gauge is reporting on.
 
 - `endpoint-scrape`: Scrapes a raw Prometheus text-format `/metrics` endpoint directly.
   Computes budget as `clamp(1 - saturation - baseline, 0, 1)`.
@@ -572,6 +575,8 @@ The Async Processor exposes Prometheus metrics under the `llm_d_async` subsystem
 | `llm_d_async_async_dispatch_budget` | Gauge | Current dispatch budget [0.0–1.0] returned by the queue's gate; the fraction of system capacity available for new requests (0.0 = gate fully closed). Useful for diagnosing why throughput is throttled. |
 | `llm_d_async_async_pool_worker_limit` | Gauge | Configured worker concurrency limit for a pool (carries only the `pool_name` label). Compare against `llm_d_async_async_inflight_requests` to compute worker utilization. |
 | `llm_d_async_async_gate_decisions_total` | Counter | Count of gate decisions that prevented a message from being dispatched, by `reason`: `gate_closed` (no dispatch budget), `quota_exhausted` (per-attribute quota overflow), `dropped` (gate permanently rejected the request), `error` (gate evaluation failed). |
+| `llm_d_async_async_gate_metric_value` | Gauge | Raw metric value a metric-based gate (`prometheus-saturation`/`-budget`/`-query`) last read — the number compared against the threshold below. For the saturation gate this is `1 - saturation`. |
+| `llm_d_async_async_gate_metric_threshold` | Gauge | Threshold the value above is compared against. The gate closes when `value <= threshold`, which is what drives `async_dispatch_budget` to 0. |
 
 **Labels:**
 
@@ -581,6 +586,14 @@ The Async Processor exposes Prometheus metrics under the `llm_d_async` subsystem
 | `queue_name` | Logical queue name from the queue configuration |
 | `pool_name` | Worker pool the queue routes to (`async_pool_worker_limit` carries only this label) |
 | `reason` | Gate-decision reason (only on `async_gate_decisions_total`): `gate_closed`, `quota_exhausted`, `dropped`, `error` |
+| `inference_pool` | InferencePool a gate queries (only on the two `async_gate_metric_*` gauges), from the gate's `pool` param. Empty when the gate does not name one. |
+
+`pool_name` always names the **async worker pool** that owns the series, never the
+InferencePool a gate happens to query — that is what `inference_pool` is for. Every
+per-queue series therefore carries the same `queue_id`/`queue_name`/`pool_name`
+triple and joins on it, including the two gate gauges. A **pool-level** gate (one
+configured on a worker pool rather than a queue) has no single queue, so its gauges
+carry an empty `queue_id` and `queue_name` and are keyed by `pool_name` alone.
 
 **Example PromQL queries:**
 
@@ -599,6 +612,18 @@ histogram_quantile(0.95, sum by (queue_name, le) (rate(llm_d_async_async_inferen
 
 # p95 queue residence time by queue (async delay, excluding model time)
 histogram_quantile(0.95, sum by (queue_name, le) (rate(llm_d_async_async_queue_residence_time_millis_bucket[5m])))
+
+# Why is a queue's gate closed? The gauges join on the queue triple, so you can
+# put the budget, the value it came from, and the threshold on one panel.
+llm_d_async_async_dispatch_budget
+llm_d_async_async_gate_metric_value
+llm_d_async_async_gate_metric_threshold
+
+# How much headroom does each queue's gate have?
+llm_d_async_async_gate_metric_value - on(queue_id, queue_name, pool_name) llm_d_async_async_gate_metric_threshold
+
+# Throttling rate against the pool it is throttling
+sum by (pool_name) (rate(llm_d_async_async_gate_decisions_total{reason="gate_closed"}[5m]))
 ```
 
 ## Implementations

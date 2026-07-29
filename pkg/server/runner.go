@@ -137,7 +137,13 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 	poolGates := make(map[string]pipeline.Gate)
 	for poolID, pool := range poolsMap {
 		if pool.GateType != "" {
-			gate, err := gateFactory.CreateGate(pipeline.GateConfig{GateType: pool.GateType, GateParams: pool.GateParams})
+			gate, err := gateFactory.CreateGate(pipeline.GateConfig{
+				GateType:   pool.GateType,
+				GateParams: pool.GateParams,
+				// A pool gate covers every queue merged into the pool, so it has
+				// no single queue to name; pool_name alone identifies it.
+				Owner: pipeline.GateOwner{WorkerPoolID: poolID},
+			})
 			if err != nil {
 				setupLog.Error(err, "Failed to create pool gate", "poolID", poolID, "gateType", pool.GateType)
 				os.Exit(1)

@@ -298,3 +298,82 @@ func TestGateFactory_PrometheusQueryGateWithAllParams(t *testing.T) {
 	assert.NoError(t, err, "should create gate with all params specified")
 	assert.NotNil(t, gate)
 }
+
+// TestGateFactory_StampsOwnerOnMetricGate checks that the owning queue and worker
+// pool reach the gauges a metric gate records, and that the 'pool' param lands on
+// inference_pool instead of overwriting pool_name (issue #369).
+func TestGateFactory_StampsOwnerOnMetricGate(t *testing.T) {
+	owner := pipeline.GateOwner{QueueID: "team-a-premium", QueueName: "queue:a", WorkerPoolID: "model-a-pool"}
+	factory := NewGateFactory("http://localhost:9090")
+
+	gate, err := factory.CreateGate(pipeline.GateConfig{
+		GateType:   "prometheus-query",
+		GateParams: map[string]any{"query": "up", "pool": "optimized-baseline"},
+		Owner:      owner,
+	})
+	assert.NoError(t, err)
+
+	metricGate, ok := gate.(*MetricDispatchGate)
+	assert.True(t, ok, "prometheus-query should produce a MetricDispatchGate")
+	assert.Equal(t, owner, metricGate.owner)
+	assert.Equal(t, "optimized-baseline", metricGate.inferencePool)
+}
+
+// TestGateFactory_PropagatesOwnerThroughWrappers checks that the owner survives the
+// factory's recursive gate types — a gate nested inside wait-on-refuse inside
+// composite still labels its metrics with the queue that owns it (issue #369).
+func TestGateFactory_PropagatesOwnerThroughWrappers(t *testing.T) {
+	owner := pipeline.GateOwner{QueueID: "team-b-standard", QueueName: "queue:b", WorkerPoolID: "model-b-pool"}
+	factory := NewGateFactory("http://localhost:9090")
+
+	gate, err := factory.CreateGate(pipeline.GateConfig{
+		GateType: "composite",
+		GateParams: map[string]any{
+			"gates": []any{
+				map[string]any{
+					"gate_type": "wait-on-refuse",
+					"gate_params": map[string]any{
+						"gate": map[string]any{
+							"gate_type":   "prometheus-query",
+							"gate_params": map[string]any{"query": "up"},
+						},
+					},
+				},
+			},
+		},
+		Owner: owner,
+	})
+	assert.NoError(t, err)
+
+	composite, ok := gate.(*CompositeGate)
+	assert.True(t, ok)
+	assert.Len(t, composite.gates, 1)
+	waiter, ok := composite.gates[0].(*WaitOnRefuseGate)
+	assert.True(t, ok)
+	metricGate, ok := waiter.inner.(*MetricDispatchGate)
+	assert.True(t, ok)
+	assert.Equal(t, owner, metricGate.owner)
+}
+
+// TestGateFactory_PropagatesOwnerToSaturationGate covers the third recursion site,
+// tier-priority-admission's inner saturation gate (issue #369).
+func TestGateFactory_PropagatesOwnerToSaturationGate(t *testing.T) {
+	owner := pipeline.GateOwner{QueueID: "team-c-batch", QueueName: "queue:c", WorkerPoolID: "model-c-pool"}
+	factory := NewGateFactory("http://localhost:9090")
+
+	gate, err := factory.CreateGate(pipeline.GateConfig{
+		GateType: "tier-priority-admission",
+		GateParams: map[string]any{
+			"saturation_gate":        "prometheus-query",
+			"saturation_gate_params": map[string]any{"query": "up"},
+		},
+		Owner: owner,
+	})
+	assert.NoError(t, err)
+
+	tierGate, ok := gate.(*TierPriorityAdmissionGate)
+	assert.True(t, ok)
+	metricGate, ok := tierGate.saturationGate.(*MetricDispatchGate)
+	assert.True(t, ok)
+	assert.Equal(t, owner, metricGate.owner)
+}

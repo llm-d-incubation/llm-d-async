@@ -36,16 +36,27 @@ var _ pipeline.Gate = (*MetricDispatchGate)(nil)
 // formula N = max_SYS × (D − B) when threshold is set to the reserved baseline B.
 // On error or missing/invalid data, the gate returns the configured fallback budget.
 type MetricDispatchGate struct {
-	source    MetricSource
-	threshold float64
-	fallback  float64
-	poolLabel string
+	source        MetricSource
+	threshold     float64
+	fallback      float64
+	owner         pipeline.GateOwner
+	inferencePool string
 }
 
-// WithPoolLabel sets the pool name used to label the async_gate_metric_value and
-// async_gate_metric_threshold gauges this gate records on each evaluation.
-func (g *MetricDispatchGate) WithPoolLabel(pool string) *MetricDispatchGate {
-	g.poolLabel = pool
+// WithOwner sets the queue or worker pool this gate belongs to. Its
+// queue_id/queue_name/pool_name label the async_gate_metric_value and
+// async_gate_metric_threshold gauges, so they join with the owner's other
+// series (async_dispatch_budget, async_gate_decisions_total, ...).
+func (g *MetricDispatchGate) WithOwner(owner pipeline.GateOwner) *MetricDispatchGate {
+	g.owner = owner
+	return g
+}
+
+// WithInferencePool sets the InferencePool this gate queries, exposed as the
+// inference_pool label on the gauges above. It is what the gate measures, not
+// who it throttles — pool_name is the latter.
+func (g *MetricDispatchGate) WithInferencePool(pool string) *MetricDispatchGate {
+	g.inferencePool = pool
 	return g
 }
 
@@ -102,7 +113,7 @@ func (g *MetricDispatchGate) Budget(ctx context.Context) float64 {
 
 	// Expose the raw value and threshold so operators can see why the gate is
 	// open/closed (it closes when value <= threshold).
-	metrics.SetGateMetricValue(value, g.threshold, g.poolLabel)
+	metrics.SetGateMetricValue(value, g.threshold, g.owner.QueueID, g.owner.QueueName, g.owner.WorkerPoolID, g.inferencePool)
 
 	if value <= g.threshold {
 		return 0.0

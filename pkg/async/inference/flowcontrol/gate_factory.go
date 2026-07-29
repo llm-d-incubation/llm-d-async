@@ -109,6 +109,7 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 
 		var innerGates []pipeline.Gate
 		for _, innerCfg := range configs {
+			innerCfg.Owner = cfg.Owner
 			gate, err := f.CreateGate(innerCfg)
 			if err != nil {
 				return nil, fmt.Errorf("composite gate failed to create inner gate %q: %w", innerCfg.GateType, err)
@@ -124,6 +125,7 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 			return nil, err
 		}
 
+		innerCfg.Owner = cfg.Owner
 		innerGate, err := f.CreateGate(innerCfg)
 		if err != nil {
 			return nil, fmt.Errorf("wait-on-refuse gate failed to create inner gate %q: %w", innerCfg.GateType, err)
@@ -144,6 +146,7 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 		satGate, err := f.CreateGate(pipeline.GateConfig{
 			GateType:   satGateType,
 			GateParams: satGateParams,
+			Owner:      cfg.Owner,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("tier-priority-admission gate failed to create saturation gate %q: %w", satGateType, err)
@@ -230,7 +233,8 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 			ms = NewCachedMetricSource(source, f.cacheTTL)
 		}
 		return NewSaturationDispatchGate(ms, threshold, fallback).
-			WithPoolLabel(paramString(params, "pool", "")), nil
+			WithOwner(cfg.Owner).
+			WithInferencePool(paramString(params, "pool", "")), nil
 
 	case "prometheus-budget":
 		if f.prometheusURL == "" {
@@ -276,7 +280,9 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 			cachedSource(primary, f.cacheTTL),
 			cachedSource(secondary, f.cacheTTL),
 		)
-		return NewBudgetDispatchGate(ms, baseline, fallback).WithPoolLabel(pool), nil
+		return NewBudgetDispatchGate(ms, baseline, fallback).
+			WithOwner(cfg.Owner).
+			WithInferencePool(pool), nil
 
 	case "prometheus-query":
 		if f.prometheusURL == "" {
@@ -298,10 +304,12 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 		if err != nil {
 			return nil, err
 		}
-		// Optional 'pool' param labels the async_gate_metric_value gauge; set it to
-		// match the inference pool referenced in the query.
+		// Optional 'pool' param records which InferencePool the query is about, as
+		// the inference_pool label on async_gate_metric_value; it does not affect
+		// the query. pool_name comes from the queue or pool that owns the gate.
 		return NewMetricDispatchGate(cachedSource(source, f.cacheTTL), 0.0, fallback).
-			WithPoolLabel(paramString(params, "pool", "")), nil
+			WithOwner(cfg.Owner).
+			WithInferencePool(paramString(params, "pool", "")), nil
 
 	case "endpoint-scrape":
 		url := paramString(params, "url", "")

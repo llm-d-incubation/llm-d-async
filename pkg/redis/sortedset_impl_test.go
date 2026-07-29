@@ -1607,6 +1607,39 @@ func TestNewRedisSortedSetFlow_PoolRequiredAndValidation(t *testing.T) {
 	}
 }
 
+// TestNewRedisSortedSetFlow_DefaultsWorkerPoolIDInConfigMap checks that a queue
+// config with no worker_pool_id is normalized before it is stored: configMap is
+// the source of the pool_name label on async_dispatch_budget and
+// async_gate_decisions_total, and it used to keep the raw "" while the request
+// channel — and every pool-keyed series — said "default" (issue #369).
+func TestNewRedisSortedSetFlow_DefaultsWorkerPoolIDInConfigMap(t *testing.T) {
+	s := miniredis.RunT(t)
+	defer s.Close()
+	connOpts := ConnectionOptions{URL: "redis://" + s.Addr()}
+	opts := SortedSetFlowOptions{
+		PollIntervalMs: 1000,
+		BatchSize:      10,
+		GateParamsJSON: "{}",
+		QueuesConfig:   `[{"id":"q1","queue_name":"test-queue","inference_objective":"obj","igw_base_url":"http://gw"}]`,
+	}
+
+	flow, err := NewRedisSortedSetFlow(opts, connOpts, WithSortedSetWorkerPools([]pipeline.WorkerPoolConfig{{ID: "default", Workers: 1}}))
+	if err != nil {
+		t.Fatalf("Unexpected error creating flow: %v", err)
+	}
+
+	cfg, ok := flow.configMap["q1"]
+	if !ok {
+		t.Fatal("Expected queue q1 in configMap")
+	}
+	if cfg.WorkerPoolID != "default" {
+		t.Errorf("configMap worker pool = %q, want %q", cfg.WorkerPoolID, "default")
+	}
+	if got := flow.requestChannels[0].channel.WorkerPoolID; got != cfg.WorkerPoolID {
+		t.Errorf("request channel worker pool = %q, configMap says %q; the two must agree or the metrics do not join", got, cfg.WorkerPoolID)
+	}
+}
+
 func TestQueueBacklog(t *testing.T) {
 	_, rdb, ctx, cancel := setupTest(t)
 	defer rdb.Close() // nolint:errcheck

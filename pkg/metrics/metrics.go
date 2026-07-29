@@ -16,9 +16,20 @@ const (
 	LabelQueueName = "queue_name"
 	LabelPoolName  = "pool_name"
 	LabelReason    = "reason"
+
+	// LabelInferencePool names the InferencePool a gate queries. It is distinct
+	// from pool_name, which always names the async worker pool that owns the
+	// series — several worker pools may gate on one InferencePool, and one
+	// worker pool may serve several.
+	LabelInferencePool = "inference_pool"
 )
 
 var queueLabels = []string{LabelQueueID, LabelQueueName, LabelPoolName}
+
+// gateLabels is queueLabels plus the queried InferencePool. Gate gauges carry
+// the full queue triple so they join with the queue's other series; a
+// pool-level gate leaves queue_id and queue_name empty.
+var gateLabels = []string{LabelQueueID, LabelQueueName, LabelPoolName, LabelInferencePool}
 
 var (
 	Retries = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -105,12 +116,12 @@ var (
 	}, []string{LabelQueueID, LabelQueueName, LabelPoolName, LabelReason})
 	GateMetricValue = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Subsystem: SchedulerSubsystem, Name: "async_gate_metric_value",
-		Help: "Raw metric value last read by a metric-based dispatch gate (prometheus-saturation/-budget/-query), i.e. the value compared against async_gate_metric_threshold to decide the gate. The gate closes when value <= threshold. For the saturation gate the value is 1 - saturation.",
-	}, []string{LabelPoolName})
+		Help: "Raw metric value last read by a metric-based dispatch gate (prometheus-saturation/-budget/-query), i.e. the value compared against async_gate_metric_threshold to decide the gate. The gate closes when value <= threshold. For the saturation gate the value is 1 - saturation. Labeled by the queue or worker pool that owns the gate; inference_pool names the InferencePool the gate queries.",
+	}, gateLabels)
 	GateMetricThreshold = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Subsystem: SchedulerSubsystem, Name: "async_gate_metric_threshold",
 		Help: "Threshold a metric-based dispatch gate compares async_gate_metric_value against; the gate closes when value <= this threshold.",
-	}, []string{LabelPoolName})
+	}, gateLabels)
 )
 
 // Gate decision reason label values for async_gate_decisions_total.
@@ -202,11 +213,14 @@ func RecordGateDecision(reason, queueID, queueName, poolName string) {
 }
 
 // SetGateMetricValue records the raw metric value a metric-based dispatch gate
-// last read and the threshold it is compared against, for the given pool. Helps
-// answer "why is the gate closed?" (value <= threshold).
-func SetGateMetricValue(value, threshold float64, poolName string) {
-	GateMetricValue.WithLabelValues(poolName).Set(value)
-	GateMetricThreshold.WithLabelValues(poolName).Set(threshold)
+// last read and the threshold it is compared against. Helps answer "why is the
+// gate closed?" (value <= threshold). queueID/queueName/poolName identify the
+// gate's owner and match the labels on that queue's other series; inferencePool
+// is the InferencePool the gate queries, and is empty when the gate does not
+// name one.
+func SetGateMetricValue(value, threshold float64, queueID, queueName, poolName, inferencePool string) {
+	GateMetricValue.WithLabelValues(queueID, queueName, poolName, inferencePool).Set(value)
+	GateMetricThreshold.WithLabelValues(queueID, queueName, poolName, inferencePool).Set(threshold)
 }
 
 // GetCollectors returns all custom collectors for the async processor.

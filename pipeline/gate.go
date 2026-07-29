@@ -95,10 +95,24 @@ func ApplyChain(ctx context.Context, msg *api.InternalRequest, gates []Gate, rel
 	return Continue(), nil
 }
 
+// GateOwner identifies the queue or worker pool a gate was created for. It is
+// stamped by the message queue implementation at construction time and is never
+// read from user config, so a gate's own metrics can carry the same
+// queue_id/queue_name/pool_name labels as the owner's other series. A pool-level
+// gate leaves the queue fields empty.
+type GateOwner struct {
+	QueueID      string
+	QueueName    string
+	WorkerPoolID string
+}
+
 // GateConfig holds the configuration for a single gate instance.
 type GateConfig struct {
 	GateType   string         `json:"gate_type,omitempty"`
 	GateParams map[string]any `json:"gate_params,omitempty"`
+
+	// Owner is set by the caller of CreateGate, not deserialized from config.
+	Owner GateOwner `json:"-"`
 }
 
 // GateFactory defines the interface for creating Gate instances.

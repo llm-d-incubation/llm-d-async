@@ -171,9 +171,24 @@ func NewRedisSortedSetFlow(flowOpts SortedSetFlowOptions, connOpts ConnectionOpt
 
 	r.configMap = make(map[string]queueConfig, len(configs))
 	for _, cfg := range configs {
+		// Normalize before anything reads it: configMap is the source of the
+		// pool_name label on this queue's metrics, and an unset WorkerPoolID
+		// there would label them "" while the request channel below — and every
+		// pool-keyed series — says "default".
+		if cfg.WorkerPoolID == "" {
+			cfg.WorkerPoolID = "default"
+		}
+		workerPoolID := cfg.WorkerPoolID
+
 		var gate pipeline.Gate
 		if r.gateFactory != nil && cfg.GateType != "" {
-			gate, err = r.gateFactory.CreateGate(cfg.GateConfig)
+			gateCfg := cfg.GateConfig
+			gateCfg.Owner = pipeline.GateOwner{
+				QueueID:      cfg.ID,
+				QueueName:    cfg.QueueName,
+				WorkerPoolID: workerPoolID,
+			}
+			gate, err = r.gateFactory.CreateGate(gateCfg)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create gate for queue %q (gate_type=%q): %w", cfg.QueueName, cfg.GateType, err)
 			}
@@ -181,11 +196,6 @@ func NewRedisSortedSetFlow(flowOpts SortedSetFlowOptions, connOpts ConnectionOpt
 			gate = r.gate
 		} else {
 			gate = pipeline.ConstOpenGate()
-		}
-
-		workerPoolID := cfg.WorkerPoolID
-		if workerPoolID == "" {
-			workerPoolID = "default"
 		}
 
 		found := false
