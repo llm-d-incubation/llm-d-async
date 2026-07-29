@@ -112,7 +112,7 @@ var (
 	}, []string{LabelPoolName})
 	GateDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Subsystem: SchedulerSubsystem, Name: "async_gate_decisions_total",
-		Help: "Count of gate decisions that prevented a message from being dispatched, by reason (gate_closed, quota_exhausted, dropped, error).",
+		Help: "Count of gate decisions that prevented dispatch, by reason (gate_closed, quota_exhausted, dropped, error). quota_exhausted/dropped/error count individual messages refused after they were dequeued; gate_closed counts those plus each dequeue round in which the gate's budget shrank the batch to zero, which is how budget-based gates (prometheus-budget/-saturation/-query) shed work before any message is dequeued.",
 	}, []string{LabelQueueID, LabelQueueName, LabelPoolName, LabelReason})
 	GateMetricValue = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Subsystem: SchedulerSubsystem, Name: "async_gate_metric_value",
@@ -210,6 +210,17 @@ func SetPoolWorkerLimit(poolName string, n float64) {
 // message from being dispatched, labeled by reason.
 func RecordGateDecision(reason, queueID, queueName, poolName string) {
 	GateDecisions.WithLabelValues(queueID, queueName, poolName, reason).Inc()
+}
+
+// InitGateDecisions pre-creates a queue's async_gate_decisions_total series with
+// every reason at 0. A CounterVec label set that has never been incremented is
+// absent from /metrics entirely, so querying a reason that has not fired yet
+// yields an empty vector rather than 0 — indistinguishable from a queue that was
+// never configured or a scrape that never landed.
+func InitGateDecisions(queueID, queueName, poolName string) {
+	for _, reason := range []string{ReasonGateClosed, ReasonQuotaExhausted, ReasonDropped, ReasonError} {
+		GateDecisions.WithLabelValues(queueID, queueName, poolName, reason)
+	}
 }
 
 // SetGateMetricValue records the raw metric value a metric-based dispatch gate

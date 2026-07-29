@@ -89,6 +89,21 @@ func TestRecordGateDecision(t *testing.T) {
 	}
 }
 
+func TestInitGateDecisions(t *testing.T) {
+	InitGateDecisions("q10", "queue-10", "pool-y")
+
+	for _, reason := range []string{ReasonGateClosed, ReasonQuotaExhausted, ReasonDropped, ReasonError} {
+		// A never-incremented CounterVec label set is absent from /metrics, so
+		// the point of the pre-creation is that these series exist and read 0.
+		if got := testutil.ToFloat64(GateDecisions.WithLabelValues("q10", "queue-10", "pool-y", reason)); got != 0 {
+			t.Errorf("GateDecisions[%s] = %v, want 0", reason, got)
+		}
+	}
+	if got := testutil.CollectAndCount(GateDecisions, "llm_d_async_async_gate_decisions_total"); got < 4 {
+		t.Errorf("GateDecisions series count = %d, want at least 4", got)
+	}
+}
+
 func TestGetAsyncProcessorCollectors_includesGateDecisions(t *testing.T) {
 	for _, withLatency := range []bool{false, true} {
 		collectors := GetAsyncProcessorCollectors(withLatency)

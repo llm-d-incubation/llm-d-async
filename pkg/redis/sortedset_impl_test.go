@@ -12,8 +12,11 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/go-logr/logr"
 	"github.com/llm-d/llm-d-async/api"
 	"github.com/llm-d/llm-d-async/pipeline"
+	"github.com/llm-d/llm-d-async/pkg/metrics"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -1034,6 +1037,55 @@ func TestSortedSetFlow_ZeroBudget(t *testing.T) {
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("Message should be pulled after budget increased")
+	}
+}
+
+func TestSortedSetFlow_ClosedGateRecordsGateClosedDecision(t *testing.T) {
+	s, rdb, ctx, cancel := setupTest(t)
+	defer s.Close()
+	defer rdb.Close() // nolint:errcheck
+	defer cancel()
+
+	queue := "gate-closed-metric-queue"
+	queueID := "gate-closed-metric-id"
+	gateClosed := func() float64 {
+		return testutil.ToFloat64(metrics.GateDecisions.WithLabelValues(queueID, queue, "", metrics.ReasonGateClosed))
+	}
+
+	flow := &RedisSortedSetFlow{
+		rdb:          rdb,
+		pollInterval: 50 * time.Millisecond,
+		batchSize:    10,
+		gate:         pipeline.DispatchGateFunc(func(ctx context.Context) float64 { return 0.0 }),
+	}
+	msgChannel := make(chan *api.InternalRequest, 1)
+
+	// Nothing queued: the gate held nothing back, so nothing is counted.
+	flow.processMessages(ctx, msgChannel, queue, queueID, flow.gate, logr.Discard())
+	if got := gateClosed(); got != 0 {
+		t.Fatalf("gate_closed on an empty queue = %v, want 0", got)
+	}
+
+	msg := api.RequestMessage{
+		ID:       "gate-closed-1",
+		Created:  time.Now().Unix(),
+		Deadline: 9999999999,
+		Payload:  map[string]any{"test": "data"},
+	}
+	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix()), Member: envelopeJSON(msg)})
+
+	// Work is waiting and the budget zeroes the batch: each throttled poll is a
+	// gate_closed decision, even though no message is ever dequeued (#368).
+	flow.processMessages(ctx, msgChannel, queue, queueID, flow.gate, logr.Discard())
+	flow.processMessages(ctx, msgChannel, queue, queueID, flow.gate, logr.Discard())
+	if got := gateClosed(); got != 2 {
+		t.Fatalf("gate_closed with a backlogged queue = %v, want 2", got)
+	}
+	if len(msgChannel) != 0 {
+		t.Fatalf("message dispatched while the gate was closed")
+	}
+	if count, _ := rdb.ZCard(ctx, queue).Result(); count != 1 {
+		t.Fatalf("queue depth = %d, want the message left in place", count)
 	}
 }
 
