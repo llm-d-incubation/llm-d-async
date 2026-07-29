@@ -24,6 +24,14 @@ ap:
         gate_type: "prometheus-budget"
         gate_params:
           pool: "optimized-baseline"
+          # Per *ready pod* request capacity, not a pool-wide total: the gate
+          # closes once load reaches ready_pods * max_concurrency * (1 - baseline),
+          # i.e. 95 concurrent requests on the single Qwen3-0.6B replica this
+          # guide deploys. 100 matches the EPP saturation detector's default and
+          # is reachable by the guide's own load test (hey, 200 workers).
+          # Re-derive it for your own model and hardware -- a value your pool
+          # never reaches leaves the gate permanently open. See the
+          # "Size max_concurrency for your pool" section of the guide.
           max_concurrency: "100"
           baseline: "0.05"
   podMonitor:

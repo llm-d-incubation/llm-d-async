@@ -26,6 +26,7 @@ import (
 	redisgate "github.com/llm-d/llm-d-async/pkg/redis"
 	promapi "github.com/prometheus/client_golang/api"
 	goredis "github.com/redis/go-redis/v9"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // DefaultCacheTTL is the default TTL for cached Prometheus metric sources.
@@ -87,6 +88,10 @@ func (f *GateFactory) Close() error {
 //     Gate closes when D ≤ B (baseline); returns D − B when open, so callers compute
 //     N = max_SYS × (D − B). Params: pool (required),
 //     max_concurrency (default 100), baseline (default 0.05), fallback (default 0.0)
+//     max_concurrency is per ready pod, not for the pool as a whole: the gate closes
+//     once the observed load reaches max_concurrency × (1 − baseline) per ready pod.
+//     Set it too high for the pool's real capacity and the gate never closes; the
+//     resolved closing point is logged at gate creation so this is visible.
 //   - "prometheus-query": Evaluates an arbitrary user-supplied PromQL expression as the dispatch
 //     budget. The expression must resolve to an instant vector with a single sample whose value
 //     is in [0, 1]. Unlike prometheus-saturation and prometheus-budget, this gate does not
@@ -280,6 +285,18 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 			cachedSource(primary, f.cacheTTL),
 			cachedSource(secondary, f.cacheTTL),
 		)
+
+		// Report the resolved closing point. max_concurrency is a per-ready-pod
+		// divisor, so a value the pool can never reach leaves the gate
+		// permanently open with nothing in the logs or metrics to say so.
+		// Surfacing it here makes a mis-sized max_concurrency visible at startup.
+		log.Log.WithName("gate-factory").Info("prometheus-budget gate configured",
+			"pool", pool,
+			"maxConcurrency", maxConcurrency,
+			"baseline", baseline,
+			"closesAtLoadPerReadyPod", maxConcurrency*(1-baseline),
+		)
+
 		return NewBudgetDispatchGate(ms, baseline, fallback).
 			WithOwner(cfg.Owner).
 			WithInferencePool(pool), nil

@@ -291,9 +291,43 @@ For more fine-grained control, configure gates per queue in your configuration f
     `inference_pool_ready_pods{name="<pool>"}` (EPP metric) and, for the vLLM fallback,
     the `inference_pool` label on scraped vLLM metrics (added via relabeling from pod labels).
   - `namespace` (optional): Kubernetes namespace to scope metric queries. Required when multiple namespaces share the same pool name with a shared Prometheus instance.
-  - `max_concurrency` (optional): Per-endpoint request capacity (`MaxConcurrency` in the [inference scheduler's saturation detector](https://github.com/llm-d/llm-d-inference-scheduler/blob/main/pkg/epp/framework/plugins/flowcontrol/saturationdetector/concurrency/config.go)). Default is `100` (matching the inference scheduler default).
+  - `max_concurrency` (optional): Per-endpoint request capacity (`MaxConcurrency` in the [inference scheduler's saturation detector](https://github.com/llm-d/llm-d-inference-scheduler/blob/main/pkg/epp/framework/plugins/flowcontrol/saturationdetector/concurrency/config.go)). Default is `100` (matching the inference scheduler default). See [sizing `max_concurrency`](#sizing-max_concurrency) below — this is a **per-pod** number, and setting it above what a pod actually serves makes the gate inert.
   - `baseline` (optional): Reserved baseline B. The gate closes when D ≤ B. Default is `0.05`.
   - `fallback` (optional): Fallback budget value (0.0-1.0) returned when all metric sources are unavailable. Default is `0.0` (fail closed).
+
+  <a id="sizing-max_concurrency"></a>
+  **Sizing `max_concurrency`.** Because `max_SYS = ready_pods × max_concurrency`, the gate closes only
+  once the observed load reaches:
+
+  ```
+  ready_pods × max_concurrency × (1 − baseline)
+  ```
+
+  At the defaults that is 95 concurrent requests *per ready pod*. A pool that never gets near
+  that — a large model on a few replicas, for instance — leaves the gate permanently open, so every
+  batch request dispatches regardless of live traffic. The gate logs its resolved closing point at
+  startup so you can compare it against reality:
+
+  ```
+  "prometheus-budget gate configured" pool=... maxConcurrency=100 baseline=0.05 closesAtLoadPerReadyPod=95
+  ```
+
+  Two ways to pick a value:
+
+  - **Match the EPP.** `max_concurrency` mirrors `MaxConcurrency` in the inference scheduler's
+    saturation detector. Using the same number keeps the async gate and the EPP's own admission
+    control in agreement about when the pool is full. If you have not configured the saturation
+    detector, both defaults are `100`.
+  - **Measure it.** Drive your pool to the load you consider saturated and read the per-pod peak:
+
+    ```promql
+    max_over_time(
+      (sum(vllm:num_requests_running{inference_pool="<pool>"}) / on() inference_pool_ready_pods{name="<pool>"})[1h:]
+    )
+    ```
+
+    Set `max_concurrency` to that peak. Values well above it mean the gate never closes; values
+    well below it mean the gate sheds while the pool still has room.
 
   **Metric prerequisites:** The primary metric source requires llm-d's flow control plugin to be
   enabled; without it, the gate falls back to vLLM metrics. The fallback filters by `inference_pool` label,

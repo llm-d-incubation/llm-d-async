@@ -165,7 +165,9 @@ helm install llm-d-async ${ASYNC_REPO}/charts/llm-d-async/ \
 The values file (`docs/guides/e2e-deploy/llm-d-async-values.yaml`) configures:
 - Image: `ghcr.io/llm-d/llm-d-async:938cd44`
 - Queue: Redis sorted-set with `redis.url` set directly (chart creates the Secret), configured via `queuesConfig`
-- Gate: `prometheus-budget` with pool=`optimized-baseline`, max_concurrency=100, baseline=0.05 (per-queue)
+- Gate: `prometheus-budget` with pool=`optimized-baseline`, max_concurrency=100, baseline=0.05 (per-queue).
+  `max_concurrency` is a **per ready pod** capacity — see [Size `max_concurrency` for your pool](#size-max_concurrency-for-your-pool)
+  before reusing this value on your own model
 - Prometheus URL pointing to the cluster's `llmd-kube-prometheus-stack-prometheus` service
 
 > **Multi-namespace deployments:** If the cluster has multiple inference pools
@@ -191,6 +193,47 @@ The values file (`docs/guides/e2e-deploy/llm-d-async-values.yaml`) configures:
   rate, low success rate, and high shed rate
 - `grafana.dashboards.enabled: true` — provisions a Grafana dashboard (via sidecar) with
   request rate, outcome breakdown, success/retry gauges, and latency percentiles
+
+### Size `max_concurrency` for your pool
+
+`max_concurrency` is the request capacity of **one ready pod**, not of the pool. The gate
+computes `max_SYS = ready_pods × max_concurrency` and closes only once the observed load
+reaches:
+
+```
+ready_pods × max_concurrency × (1 - baseline)
+```
+
+With the values above that is `1 × 100 × 0.95` = **95 concurrent requests** against the single
+Qwen3-0.6B replica this guide deploys. That is reachable here — the saturation test below drives
+200 concurrent requests, and 100 also matches the default `MaxConcurrency` of the EPP's saturation
+detector, so the async gate and the EPP agree on when the pool is full.
+
+It is not automatically reachable anywhere else. Point this configuration at a larger model on a
+few replicas and a realistic workload may peak in the single digits per pod, far below the closing
+point — in which case the gate never closes and every batch request dispatches regardless of live
+traffic, which is the exact failure the gate exists to prevent.
+
+The processor logs its resolved closing point when it builds the gate, so check it against reality:
+
+```bash
+kubectl logs -n ${NAMESPACE} -l app.kubernetes.io/name=llm-d-async | grep "prometheus-budget gate configured"
+# "prometheus-budget gate configured" pool=optimized-baseline maxConcurrency=100 baseline=0.05 closesAtLoadPerReadyPod=95
+```
+
+To derive the value for your own model and hardware, drive the pool to the load you consider
+saturated and read the per-pod peak:
+
+```bash
+kubectl run --rm -i prom-peak --image=curlimages/curl --restart=Never -n ${NAMESPACE} -- \
+    curl -s --data-urlencode \
+    'query=max_over_time((sum(vllm:num_requests_running{inference_pool="optimized-baseline"}) / on() inference_pool_ready_pods{name="optimized-baseline"})[1h:])' \
+    'http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090/api/v1/query'
+```
+
+Set `max_concurrency` to that peak. Well above it and the gate never closes; well below it and the
+gate sheds while the pool still has room. If you change it, update the `* 100` divisor in the
+verification queries below to match.
 
 ## Verify
 
