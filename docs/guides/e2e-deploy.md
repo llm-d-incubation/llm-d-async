@@ -14,9 +14,13 @@ export LLM_D_REPO=/path/to/llm-d        # local checkout of github.com/llm-d/llm
 export ASYNC_REPO=/path/to/llm-d-async   # this repo
 export NAMESPACE=llm-d-async              # choose your namespace
 export GAIE_VERSION=v1.5.0
+export ROUTER_CHART_VERSION=v0.9.0
 export GATEWAY_API_VERSION=v1.5.1
 export GUIDE_NAME=optimized-baseline
 ```
+
+`GAIE_VERSION` and `ROUTER_CHART_VERSION` track upstream; `${LLM_D_REPO}/guides/env.sh`
+is the source of truth for the versions the llm-d guides are tested against.
 
 ## Step 1: Install CRDs
 
@@ -43,7 +47,7 @@ export PATH="$PWD/istio-${ISTIO_VERSION}/bin:$PATH"
 istioctl install -y --set values.pilot.env.ENABLE_GATEWAY_API_INFERENCE_EXTENSION=true
 ```
 
-Reference: [llm-d istio gateway guide](https://github.com/llm-d/llm-d/blob/main/guides/prereq/gateways/istio.md)
+Reference: [llm-d istio gateway guide](https://github.com/llm-d/llm-d/blob/main/docs/infrastructure/gateway/istio.md)
 
 ## Step 4: Deploy Gateway
 
@@ -57,22 +61,30 @@ kubectl wait --for=jsonpath='{.status.conditions[?(@.type=="Programmed")].status
 
 ```bash
 helm install ${GUIDE_NAME} \
-    oci://registry.k8s.io/gateway-api-inference-extension/charts/inferencepool \
-    -f ${LLM_D_REPO}/guides/recipes/scheduler/base.values.yaml \
-    -f ${LLM_D_REPO}/guides/${GUIDE_NAME}/scheduler/${GUIDE_NAME}.values.yaml \
+    oci://ghcr.io/llm-d/charts/llm-d-router-gateway \
+    -f ${LLM_D_REPO}/guides/recipes/router/base.values.yaml \
+    -f ${LLM_D_REPO}/guides/${GUIDE_NAME}/router/${GUIDE_NAME}.values.yaml \
+    -f ${LLM_D_REPO}/guides/recipes/router/features/monitoring.values.yaml \
     --set provider.name=istio \
-    --set experimentalHttpRoute.enabled=true \
-    --set experimentalHttpRoute.inferenceGatewayName=llm-d-inference-gateway \
-    --set inferenceExtension.monitoring.prometheus.enabled=true \
-    -n ${NAMESPACE} --version ${GAIE_VERSION}
+    --set httpRoute.create=true \
+    --set httpRoute.inferenceGatewayName=llm-d-inference-gateway \
+    -n ${NAMESPACE} --version ${ROUTER_CHART_VERSION}
 ```
 
-`monitoring.prometheus.enabled=true` creates:
-- A `ServiceMonitor` for EPP metrics (`optimized-baseline-epp-monitor`)
-- A metrics reader `Secret` with a bearer token (`inference-gateway-sa-metrics-reader-secret`)
-- Proper RBAC (ClusterRoleBinding to `system:auth-delegator` for the EPP ServiceAccount)
+This creates the EPP `Deployment` and `Service`, an `InferencePool` named
+`optimized-baseline` (selecting pods labeled `llm-d.ai/guide: optimized-baseline`,
+which is what Step 6 applies), an `HTTPRoute` attached to the gateway, and — from
+`monitoring.values.yaml` — a `ServiceMonitor` named `optimized-baseline-epp-monitor`
+scraping EPP `/metrics` every 10s. The chart also creates a dedicated `ClusterRole`
+and `ClusterRoleBinding` for the EPP ServiceAccount granting `tokenreviews`,
+`subjectaccessreviews`, and `nonResourceURLs: /metrics`.
 
-Reference: [llm-d monitoring docs](https://github.com/llm-d/llm-d/blob/main/docs/monitoring/README.md)
+The recipe leaves metrics authentication off (`auth.enabled: false`), so the
+ServiceMonitor scrapes without a bearer token and no metrics-reader `Secret` is
+created. If you enable auth, Prometheus needs a token with the `/metrics`
+permission granted by that ClusterRole.
+
+Reference: [llm-d observability setup](https://github.com/llm-d/llm-d/blob/main/docs/operations/observability/setup.md)
 
 ## Step 6: Deploy vLLM model server (Qwen/Qwen3-0.6B)
 
@@ -107,10 +119,13 @@ kubectl wait --for=condition=Ready pod -l llm-d.ai/role=decode -n ${NAMESPACE} -
 
 ```bash
 cd ${LLM_D_REPO}
-./docs/monitoring/scripts/install-prometheus-grafana.sh
+./guides/recipes/observability/install-prometheus-grafana.sh
 ```
 
-Reference: [Prometheus/Grafana quickstart](https://github.com/llm-d/llm-d/blob/main/docs/monitoring/prometheus-grafana-stack.md)
+This installs the kube-prometheus-stack into the `llm-d-monitoring` namespace,
+watching all namespaces.
+
+Reference: [llm-d observability setup](https://github.com/llm-d/llm-d/blob/main/docs/operations/observability/setup.md)
 
 Verify EPP metrics are flowing into Prometheus:
 
