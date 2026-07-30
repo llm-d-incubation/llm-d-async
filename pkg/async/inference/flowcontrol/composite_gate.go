@@ -24,17 +24,67 @@ import (
 )
 
 var _ pipeline.Gate = (*CompositeGate)(nil)
+var _ pipeline.FeedbackGate = (*CompositeGate)(nil)
+var _ pipeline.WaitNotifier = (*CompositeGate)(nil)
 
 // CompositeGate combines multiple pipeline.Gates.
 // It returns the minimum budget across all inner Gates.
 // It applies all inner gates (all or nothing) to incoming requests.
+// Feedback and wait signals pass through: outcomes are forwarded to every
+// inner gate that consumes them, and inner wait signals are fanned in, so
+// wrapping a feedback gate in a composite does not sever its signal.
 type CompositeGate struct {
 	gates []pipeline.Gate
+	wait  <-chan struct{}
 }
 
 // NewCompositeGate creates a CompositeGate with the given inner gates.
 func NewCompositeGate(gates ...pipeline.Gate) *CompositeGate {
-	return &CompositeGate{gates: gates}
+	c := &CompositeGate{gates: gates}
+	var signals []<-chan struct{}
+	for _, gate := range gates {
+		if notifier, ok := gate.(pipeline.WaitNotifier); ok {
+			signals = append(signals, notifier.WaitSignal())
+		}
+	}
+	switch len(signals) {
+	case 0:
+		// c.wait stays nil: receives block forever, same as no wake support.
+	case 1:
+		c.wait = signals[0]
+	default:
+		// Fan the inner signals into one channel. The forwarding goroutines
+		// live as long as the process, like the gate itself.
+		merged := make(chan struct{}, 1)
+		for _, signal := range signals {
+			go func(signal <-chan struct{}) {
+				for range signal {
+					select {
+					case merged <- struct{}{}:
+					default:
+					}
+				}
+			}(signal)
+		}
+		c.wait = merged
+	}
+	return c
+}
+
+// ObserveOutcome implements pipeline.FeedbackGate by forwarding the outcome
+// to every inner gate that consumes feedback.
+func (c *CompositeGate) ObserveOutcome(fb pipeline.DispatchFeedback) {
+	for _, gate := range c.gates {
+		if feedbackGate, ok := gate.(pipeline.FeedbackGate); ok {
+			feedbackGate.ObserveOutcome(fb)
+		}
+	}
+}
+
+// WaitSignal implements pipeline.WaitNotifier with the fan-in of the inner
+// gates' wait signals; nil when no inner gate notifies.
+func (c *CompositeGate) WaitSignal() <-chan struct{} {
+	return c.wait
 }
 
 // Budget implements pipeline.Gate.
