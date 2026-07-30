@@ -36,6 +36,13 @@ type InferenceError interface {
 
 var _ InferenceError = (*ClientError)(nil)
 
+// DroppedReasonHeader is the response header llm-d-router's flow control uses
+// to communicate the machine-readable reason a request was rejected before
+// dispatch or evicted in flight. The router sets it on both 429 (rejected for
+// capacity or queue TTL, evicted after dispatch) and 503 (no endpoints, client
+// disconnected, shutting down) responses.
+const DroppedReasonHeader = "x-llm-d-request-dropped-reason"
+
 // ClientError represents an inference client error with category and context.
 type ClientError struct {
 	ErrorCategory ErrorCategory
@@ -43,13 +50,18 @@ type ClientError struct {
 	RawError      error         // original error if available
 	RetryAfter    time.Duration // server-specified retry delay from Retry-After header (0 means not set)
 	StatusCode    int           // HTTP status code; 0 means no HTTP response was received
+	DroppedReason string        // machine-readable drop reason from DroppedReasonHeader (empty means not set)
 }
 
 func (e *ClientError) Error() string {
-	if e.RawError != nil {
-		return fmt.Sprintf("%s: %s (caused by: %v)", e.ErrorCategory, e.Message, e.RawError)
+	msg := e.Message
+	if e.DroppedReason != "" {
+		msg = fmt.Sprintf("%s (dropped: %s)", msg, e.DroppedReason)
 	}
-	return fmt.Sprintf("%s: %s", e.ErrorCategory, e.Message)
+	if e.RawError != nil {
+		return fmt.Sprintf("%s: %s (caused by: %v)", e.ErrorCategory, msg, e.RawError)
+	}
+	return fmt.Sprintf("%s: %s", e.ErrorCategory, msg)
 }
 
 func (e *ClientError) Unwrap() error {
