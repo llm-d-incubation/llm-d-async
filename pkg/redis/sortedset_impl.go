@@ -129,6 +129,14 @@ func NewRedisSortedSetFlow(cfg SortedSetConfig, workerPools []pipeline.WorkerPoo
 		}
 	}
 
+	// Retry messages that lack an explicit RequestQueueName fall back to this
+	// name when re-enqueued (flushRetryBatch). Default to the first configured
+	// queue so retries land on a real key rather than "" — preserving the
+	// previous single-queue fallback behavior.
+	if len(cfg.Queues) > 0 {
+		r.defaultRequestQueueName = cfg.Queues[0].QueueName
+	}
+
 	r.configMap = make(map[string]SortedSetQueueConfig, len(cfg.Queues))
 	for _, cfg := range cfg.Queues {
 		// Normalize before anything reads it: configMap is the source of the

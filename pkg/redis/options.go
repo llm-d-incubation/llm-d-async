@@ -56,6 +56,9 @@ func (c *PubSubConfig) ApplyDefaults() {
 }
 
 func (c *PubSubConfig) Validate() error {
+	if c.URL == "" {
+		return fmt.Errorf("url is required (set url in the transport config or REDIS_URL)")
+	}
 	if len(c.Queues) == 0 {
 		return fmt.Errorf("at least one queue must be configured")
 	}
@@ -125,6 +128,9 @@ func (c *SortedSetConfig) ApplyDefaults() {
 }
 
 func (c *SortedSetConfig) Validate() error {
+	if c.URL == "" {
+		return fmt.Errorf("url is required (set url in the transport config or REDIS_URL)")
+	}
 	if len(c.Queues) == 0 {
 		return fmt.Errorf("at least one queue must be configured")
 	}

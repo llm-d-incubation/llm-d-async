@@ -14,45 +14,47 @@ import (
 // deprecatedFlags maps a deprecated flag name to the suggested replacement.
 // The new --transport / --transport-config[-file] surface supersedes all of
 // these; they are kept working via the translation shim below.
-var deprecatedFlags = map[string]string{
-	"message-queue-impl": "--transport",
-	"redis-tracing":      "enable_tracing in --transport-config",
+func deprecatedFlags() map[string]string {
+	return map[string]string{
+		"message-queue-impl": "--transport",
+		"redis-tracing":      "enable_tracing in --transport-config",
 
-	// Redis connection (shared by redis-pubsub and redis-sortedset).
-	"redis.url": "url in --transport-config",
+		// Redis connection (shared by redis-pubsub and redis-sortedset).
+		"redis.url": "url in --transport-config",
 
-	// redis-pubsub per-backend flags.
-	"redis.igw-base-url":        "--transport-config (redis-pubsub)",
-	"redis.request-path-url":    "--transport-config (redis-pubsub)",
-	"redis.inference-objective": "--transport-config (redis-pubsub)",
-	"redis.request-queue-name":  "--transport-config (redis-pubsub)",
-	"redis.retry-queue-name":    "--transport-config (redis-pubsub)",
-	"redis.result-queue-name":   "--transport-config (redis-pubsub)",
-	"redis.queues-config":       "--transport-config (redis-pubsub)",
-	"redis.queues-config-file":  "--transport-config-file (redis-pubsub)",
+		// redis-pubsub per-backend flags.
+		"redis.igw-base-url":        "--transport-config (redis-pubsub)",
+		"redis.request-path-url":    "--transport-config (redis-pubsub)",
+		"redis.inference-objective": "--transport-config (redis-pubsub)",
+		"redis.request-queue-name":  "--transport-config (redis-pubsub)",
+		"redis.retry-queue-name":    "--transport-config (redis-pubsub)",
+		"redis.result-queue-name":   "--transport-config (redis-pubsub)",
+		"redis.queues-config":       "--transport-config (redis-pubsub)",
+		"redis.queues-config-file":  "--transport-config-file (redis-pubsub)",
 
-	// redis-sortedset per-backend flags.
-	"redis.ss.igw-base-url":        "--transport-config (redis-sortedset)",
-	"redis.ss.request-path-url":    "--transport-config (redis-sortedset)",
-	"redis.ss.inference-objective": "--transport-config (redis-sortedset)",
-	"redis.ss.request-queue-name":  "--transport-config (redis-sortedset)",
-	"redis.ss.result-queue-name":   "--transport-config (redis-sortedset)",
-	"redis.ss.queues-config":       "--transport-config (redis-sortedset)",
-	"redis.ss.queues-config-file":  "--transport-config-file (redis-sortedset)",
-	"redis.ss.poll-interval-ms":    "poll_interval_ms in --transport-config",
-	"redis.ss.batch-size":          "batch_size in --transport-config",
-	"redis.ss.gate-type":           "gate_type in --transport-config",
-	"redis.ss.gate-params":         "gate_params in --transport-config",
+		// redis-sortedset per-backend flags.
+		"redis.ss.igw-base-url":        "--transport-config (redis-sortedset)",
+		"redis.ss.request-path-url":    "--transport-config (redis-sortedset)",
+		"redis.ss.inference-objective": "--transport-config (redis-sortedset)",
+		"redis.ss.request-queue-name":  "--transport-config (redis-sortedset)",
+		"redis.ss.result-queue-name":   "--transport-config (redis-sortedset)",
+		"redis.ss.queues-config":       "--transport-config (redis-sortedset)",
+		"redis.ss.queues-config-file":  "--transport-config-file (redis-sortedset)",
+		"redis.ss.poll-interval-ms":    "poll_interval_ms in --transport-config",
+		"redis.ss.batch-size":          "batch_size in --transport-config",
+		"redis.ss.gate-type":           "gate_type in --transport-config",
+		"redis.ss.gate-params":         "gate_params in --transport-config",
 
-	// gcp-pubsub per-backend flags.
-	"pubsub.igw-base-url":          "--transport-config (gcp-pubsub)",
-	"pubsub.project-id":            "project_id in --transport-config",
-	"pubsub.request-path-url":      "--transport-config (gcp-pubsub)",
-	"pubsub.inference-objective":   "--transport-config (gcp-pubsub)",
-	"pubsub.request-subscriber-id": "--transport-config (gcp-pubsub)",
-	"pubsub.result-topic-id":       "result_topic_id in --transport-config",
-	"pubsub.topics-config-file":    "--transport-config-file (gcp-pubsub)",
-	"pubsub.batch-size":            "batch_size in --transport-config",
+		// gcp-pubsub per-backend flags.
+		"pubsub.igw-base-url":          "--transport-config (gcp-pubsub)",
+		"pubsub.project-id":            "project_id in --transport-config",
+		"pubsub.request-path-url":      "--transport-config (gcp-pubsub)",
+		"pubsub.inference-objective":   "--transport-config (gcp-pubsub)",
+		"pubsub.request-subscriber-id": "--transport-config (gcp-pubsub)",
+		"pubsub.result-topic-id":       "result_topic_id in --transport-config",
+		"pubsub.topics-config-file":    "--transport-config-file (gcp-pubsub)",
+		"pubsub.batch-size":            "batch_size in --transport-config",
+	}
 }
 
 // WarnDeprecatedFlags logs a deprecation warning for every deprecated flag the
@@ -63,7 +65,7 @@ func (o *Options) WarnDeprecatedFlags(logger logr.Logger) {
 		return
 	}
 	newPath := o.usingNewTransport()
-	for name, replacement := range deprecatedFlags {
+	for name, replacement := range deprecatedFlags() {
 		if !o.flagSet.Changed(name) {
 			continue
 		}
@@ -152,7 +154,11 @@ func (o *Options) synthesizeRedisPubSubConfig() ([]byte, error) {
 		EnableTracing:   o.Observability.RedisTracing,
 		Queues:          queues,
 	}
-	return json.Marshal(cfg)
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal redis-pubsub config: %w", err)
+	}
+	return data, nil
 }
 
 func legacyRedisPubSubQueues(opts redis.PubSubFlowOptions) ([]redis.QueueConfig, error) {
@@ -196,7 +202,11 @@ func (o *Options) synthesizeRedisSortedSetConfig() ([]byte, error) {
 		EnableTracing:   o.Observability.RedisTracing,
 		Queues:          queues,
 	}
-	return json.Marshal(cfg)
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal redis-sortedset config: %w", err)
+	}
+	return data, nil
 }
 
 func legacyRedisSortedSetQueues(opts redis.SortedSetFlowOptions) ([]redis.SortedSetQueueConfig, error) {
@@ -243,7 +253,11 @@ func (o *Options) synthesizePubSubConfig() ([]byte, error) {
 		BatchSize:     o.PubSub.BatchSize,
 		Topics:        topics,
 	}
-	return json.Marshal(cfg)
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal gcp-pubsub config: %w", err)
+	}
+	return data, nil
 }
 
 func legacyPubSubTopics(opts pubsub.Options) ([]pubsub.TopicConfig, error) {

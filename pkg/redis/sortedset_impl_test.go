@@ -1417,7 +1417,7 @@ func TestSortedSetConfigApplyDefaults_IDInferredFromQueueName(t *testing.T) {
 }
 
 func TestSortedSetConfigValidate_DuplicateIDError(t *testing.T) {
-	cfg := SortedSetConfig{Queues: []SortedSetQueueConfig{
+	cfg := SortedSetConfig{URL: "redis://localhost:6379", Queues: []SortedSetQueueConfig{
 		{ID: "same", QueueName: "q1", IGWBaseURL: "http://a"},
 		{ID: "same", QueueName: "q2", IGWBaseURL: "http://b"},
 	}}
@@ -1429,7 +1429,7 @@ func TestSortedSetConfigValidate_DuplicateIDError(t *testing.T) {
 }
 
 func TestSortedSetConfigValidate_InferredDuplicateIDError(t *testing.T) {
-	cfg := SortedSetConfig{Queues: []SortedSetQueueConfig{
+	cfg := SortedSetConfig{URL: "redis://localhost:6379", Queues: []SortedSetQueueConfig{
 		{QueueName: "same-queue", IGWBaseURL: "http://a"},
 		{QueueName: "same-queue", IGWBaseURL: "http://b"},
 	}}
@@ -1441,7 +1441,7 @@ func TestSortedSetConfigValidate_InferredDuplicateIDError(t *testing.T) {
 }
 
 func TestSortedSetConfigValidate_DuplicateQueueNameError(t *testing.T) {
-	cfg := SortedSetConfig{Queues: []SortedSetQueueConfig{
+	cfg := SortedSetConfig{URL: "redis://localhost:6379", Queues: []SortedSetQueueConfig{
 		{ID: "id-1", QueueName: "same-queue", IGWBaseURL: "http://a"},
 		{ID: "id-2", QueueName: "same-queue", IGWBaseURL: "http://b"},
 	}}
@@ -1675,6 +1675,53 @@ func TestNewRedisSortedSetFlow_DefaultsWorkerPoolIDInConfigMap(t *testing.T) {
 	}
 	if got := flow.requestChannels[0].channel.WorkerPoolID; got != qcfg.WorkerPoolID {
 		t.Errorf("request channel worker pool = %q, configMap says %q; the two must agree or the metrics do not join", got, qcfg.WorkerPoolID)
+	}
+}
+
+// TestNewRedisSortedSetFlow_RetryFallsBackToFirstQueue is a regression test: a
+// retry message that carries no RequestQueueName must be re-enqueued to a real
+// queue key, not "". NewRedisSortedSetFlow seeds defaultRequestQueueName from
+// the first configured queue; without that seed flushRetryBatch ZADDs the retry
+// to the empty key "" and the message is lost.
+func TestNewRedisSortedSetFlow_RetryFallsBackToFirstQueue(t *testing.T) {
+	s := miniredis.RunT(t)
+	defer s.Close()
+
+	const primaryQueue = "primary-queue"
+	cfg := SortedSetConfig{
+		URL:            "redis://" + s.Addr(),
+		PollIntervalMs: 1000,
+		BatchSize:      10,
+		Queues: []SortedSetQueueConfig{
+			{ID: "q1", QueueName: primaryQueue, InferenceObjective: "obj", IGWBaseURL: "http://gw"},
+		},
+	}
+	cfg.ApplyDefaults()
+
+	flow, err := NewRedisSortedSetFlow(cfg, []pipeline.WorkerPoolConfig{{ID: "default", Workers: 1}}, nil)
+	if err != nil {
+		t.Fatalf("Unexpected error creating flow: %v", err)
+	}
+	defer flow.rdb.Close() // nolint:errcheck
+
+	// RetryMessage with no RequestQueueName in its routing.
+	retryMsg := pipeline.RetryMessage{
+		EmbelishedRequestMessage: pipeline.EmbelishedRequestMessage{
+			InternalRequest: api.NewInternalRequest(
+				api.InternalRouting{RetryCount: 1},
+				&api.RequestMessage{ID: "retry-no-queue", Created: time.Now().Unix(), Deadline: 9999999999},
+			),
+		},
+		BackoffDurationSeconds: 0,
+	}
+
+	flow.flushRetryBatch(context.Background(), []pipeline.RetryMessage{retryMsg})
+
+	if n, _ := flow.rdb.ZCard(context.Background(), primaryQueue).Result(); n != 1 {
+		t.Errorf("Expected retry re-enqueued to %q (ZCARD=1), got ZCARD=%d", primaryQueue, n)
+	}
+	if n, _ := flow.rdb.ZCard(context.Background(), "").Result(); n != 0 {
+		t.Errorf("Retry landed on the empty key \"\" (ZCARD=%d); default request queue was not seeded", n)
 	}
 }
 

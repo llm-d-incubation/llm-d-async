@@ -47,6 +47,12 @@ func (c *Config) Validate() error {
 	if c.ProjectID == "" {
 		return fmt.Errorf("project_id is required for gcp-pubsub transport")
 	}
+	if c.ResultTopicID == "" {
+		return fmt.Errorf("result_topic_id is required for gcp-pubsub transport")
+	}
+	if c.BatchSize <= 0 {
+		return fmt.Errorf("batch_size must be a positive integer, got %d", c.BatchSize)
+	}
 	if len(c.Topics) == 0 {
 		return fmt.Errorf("at least one topic must be configured")
 	}
