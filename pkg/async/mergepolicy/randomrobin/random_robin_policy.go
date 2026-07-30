@@ -8,25 +8,53 @@ import (
 
 	"github.com/llm-d/llm-d-async/api"
 	"github.com/llm-d/llm-d-async/pipeline"
+	"github.com/llm-d/llm-d-async/pkg/async/mergepolicy/internal/fairness"
 	"github.com/llm-d/llm-d-async/pkg/metrics"
 	"github.com/llm-d/llm-d-async/pkg/plugins"
 )
 
 func init() {
 	plugins.MustRegister("random-robin", func(name string, parameters json.RawMessage, handle plugins.Handle) (plugins.Plugin, error) {
-		return NewRandomRobinPolicy(name), nil
+		var params fairness.Params
+		if len(parameters) > 0 {
+			if err := json.Unmarshal(parameters, &params); err != nil {
+				return nil, fmt.Errorf("failed to parse random-robin parameters: %w", err)
+			}
+		}
+		return NewRandomRobinPolicy(name, Config{
+			FairnessHeader:    params.HeaderOrDefault(),
+			FairnessAttribute: params.Attribute,
+		}), nil
 	})
 }
 
-func NewRandomRobinPolicy(name string) *RandomRobinPolicy {
-	return &RandomRobinPolicy{name: name}
+// Config configures the random-robin merge policy. The zero Config disables
+// fairness stamping.
+type Config struct {
+	// FairnessHeader is the HTTP header stamped with the tenant identity so the
+	// gateway's flow control can arbitrate between tenants. Empty disables
+	// stamping.
+	FairnessHeader string
+	// FairnessAttribute is the message metadata attribute holding the tenant
+	// identity. Empty falls back to fairness.DefaultAttribute.
+	FairnessAttribute string
+}
+
+// NewRandomRobinPolicy returns a merge policy that randomly picks messages from
+// all of a pool's queues.
+func NewRandomRobinPolicy(name string, cfg Config) *RandomRobinPolicy {
+	return &RandomRobinPolicy{
+		name:     name,
+		fairness: fairness.New(cfg.FairnessHeader, cfg.FairnessAttribute),
+	}
 }
 
 var _ pipeline.RequestMergePolicy = (*RandomRobinPolicy)(nil)
 var _ plugins.Plugin = (*RandomRobinPolicy)(nil)
 
 type RandomRobinPolicy struct {
-	name string
+	name     string
+	fairness fairness.Stamper
 }
 
 func (r *RandomRobinPolicy) TypedName() plugins.TypedName {
@@ -98,6 +126,9 @@ func (r *RandomRobinPolicy) MergeRequestChannels(channels []pipeline.RequestChan
 					if chMeta.InferenceObjective != "" {
 						headers["x-gateway-inference-objective"] = chMeta.InferenceObjective
 					}
+					// Stamped before the caller's headers are merged in so that a
+					// caller-supplied fairness header wins.
+					r.fairness.Stamp(headers, ir.PublicRequest)
 					for k, v := range ir.PublicRequest.ReqHeaders() {
 						headers[k] = v
 					}

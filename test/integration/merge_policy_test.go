@@ -39,7 +39,7 @@ func TestRandomRobinPolicy_ConcurrentProducers(t *testing.T) {
 		},
 	}
 
-	policy := randomrobin.NewRandomRobinPolicy("test")
+	policy := randomrobin.NewRandomRobinPolicy("test", randomrobin.Config{})
 	dispatch := policy.MergeRequestChannels(channels, pools)
 	mergedChan := dispatch.Channels["test-pool"]
 

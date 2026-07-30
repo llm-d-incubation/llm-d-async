@@ -30,7 +30,7 @@ func TestTierPriorityOrdering(t *testing.T) {
 	pools := map[string]pipeline.WorkerPoolConfig{
 		"pool-p": {ID: "pool-p", Workers: 1},
 	}
-	policy := NewTierPriorityPolicy("test-policy", "x-gateway-priority", "tier")
+	policy := NewTierPriorityPolicy("test-policy", Config{PriorityHeader: "x-gateway-priority", TierLabel: "tier"})
 
 	// Message 1: overflow + batch => Priority 5
 	m1 := irWithLabels("msg-5", map[string]string{
@@ -154,7 +154,7 @@ func TestTierPriorityFallback(t *testing.T) {
 	pools := map[string]pipeline.WorkerPoolConfig{
 		"pool-fb": {ID: "pool-fb", Workers: 1},
 	}
-	policy := NewTierPriorityPolicy("test-policy", "x-gateway-priority", "tier")
+	policy := NewTierPriorityPolicy("test-policy", Config{PriorityHeader: "x-gateway-priority", TierLabel: "tier"})
 
 	// Message with missing labels should map to lowest priority (5)
 	m := irWithLabels("missing-labels", nil)
@@ -187,7 +187,7 @@ func TestTierPriorityCustomLabel(t *testing.T) {
 	pools := map[string]pipeline.WorkerPoolConfig{
 		"pool-fb": {ID: "pool-fb", Workers: 1},
 	}
-	policy := NewTierPriorityPolicy("test-policy", "x-gateway-priority", "my_custom_tier")
+	policy := NewTierPriorityPolicy("test-policy", Config{PriorityHeader: "x-gateway-priority", TierLabel: "my_custom_tier"})
 
 	// Message with my_custom_tier label
 	m := irWithLabels("custom-label-msg", map[string]string{

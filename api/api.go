@@ -18,9 +18,16 @@ type Request interface {
 	ReqEndpoint() string
 }
 
-// RequestMessage contains the caller-visible fields of a request. Metadata is reserved
-// for opaque, caller-supplied pass-through data (e.g. tracing IDs, user labels).
-// The system does not read or write Metadata for its own routing or correlation.
+// FairnessIDHeader is the request header llm-d-router's flow control reads to
+// arbitrate fairness between flows. The processor stamps it with the tenant
+// attribute it keys quota on, so tenant isolation extends past dispatch.
+const FairnessIDHeader = "x-llm-d-inference-fairness-id"
+
+// RequestMessage contains the caller-visible fields of a request. Metadata is
+// caller-supplied pass-through data (e.g. tracing IDs, user labels). The system
+// never writes Metadata, and reads it only where an opt-in feature is configured
+// to key on a named attribute (the redis-quota gate, request body transforms,
+// and merge-policy fairness stamping); it is otherwise opaque.
 // Request interface accessors use the Req prefix (e.g. ReqPayload) to avoid
 // colliding with the struct's exported field names used for JSON serialization.
 type RequestMessage struct {

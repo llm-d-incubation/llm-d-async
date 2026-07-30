@@ -9,6 +9,7 @@ import (
 
 	"github.com/llm-d/llm-d-async/api"
 	"github.com/llm-d/llm-d-async/pipeline"
+	"github.com/llm-d/llm-d-async/pkg/async/mergepolicy/internal/fairness"
 	"github.com/llm-d/llm-d-async/pkg/metrics"
 	"github.com/llm-d/llm-d-async/pkg/plugins"
 )
@@ -18,6 +19,7 @@ func init() {
 		var params struct {
 			PriorityHeader string `json:"priority_header"`
 			TierLabel      string `json:"tier_label"`
+			fairness.Params
 		}
 		if len(parameters) > 0 {
 			if err := json.Unmarshal(parameters, &params); err != nil {
@@ -27,21 +29,45 @@ func init() {
 		if params.PriorityHeader == "" {
 			params.PriorityHeader = "x-gateway-priority"
 		}
-		if params.TierLabel == "" {
-			params.TierLabel = "tier"
-		}
-		return NewTierPriorityPolicy(name, params.PriorityHeader, params.TierLabel), nil
+		return NewTierPriorityPolicy(name, Config{
+			PriorityHeader:    params.PriorityHeader,
+			TierLabel:         params.TierLabel,
+			FairnessHeader:    params.HeaderOrDefault(),
+			FairnessAttribute: params.Attribute,
+		}), nil
 	})
 }
 
-func NewTierPriorityPolicy(name string, priorityHeader string, tierLabel string) *TierPriorityPolicy {
+// Config configures the tier-priority merge policy. The zero Config disables
+// both the priority header and fairness stamping.
+type Config struct {
+	// PriorityHeader is the HTTP header stamped with the computed priority
+	// index. Empty disables the priority header.
+	PriorityHeader string
+	// TierLabel is the InternalRequest label holding the request's priority
+	// tier. Empty falls back to "tier".
+	TierLabel string
+	// FairnessHeader is the HTTP header stamped with the tenant identity so the
+	// gateway's flow control can arbitrate between tenants. Empty disables
+	// stamping.
+	FairnessHeader string
+	// FairnessAttribute is the message metadata attribute holding the tenant
+	// identity. Empty falls back to fairness.DefaultAttribute.
+	FairnessAttribute string
+}
+
+// NewTierPriorityPolicy returns a merge policy that buckets requests into strict
+// priority lanes and round-robins across client channels within each lane.
+func NewTierPriorityPolicy(name string, cfg Config) *TierPriorityPolicy {
+	tierLabel := cfg.TierLabel
 	if tierLabel == "" {
 		tierLabel = "tier"
 	}
 	return &TierPriorityPolicy{
 		name:           name,
-		priorityHeader: priorityHeader,
+		priorityHeader: cfg.PriorityHeader,
 		tierLabel:      tierLabel,
+		fairness:       fairness.New(cfg.FairnessHeader, cfg.FairnessAttribute),
 	}
 }
 
@@ -52,6 +78,7 @@ type TierPriorityPolicy struct {
 	name           string
 	priorityHeader string
 	tierLabel      string
+	fairness       fairness.Stamper
 }
 
 func (p *TierPriorityPolicy) TypedName() plugins.TypedName {
@@ -263,7 +290,7 @@ func (p *TierPriorityPolicy) MergeRequestChannels(channels []pipeline.RequestCha
 			}(ch, s)
 		}
 
-		go func(workerPoolID string, s *scheduler, mergedChannel chan pipeline.EmbelishedRequestMessage, priorityHeader string, tierLabel string) {
+		go func(workerPoolID string, s *scheduler, mergedChannel chan pipeline.EmbelishedRequestMessage, priorityHeader string, tierLabel string, fairnessStamper fairness.Stamper) {
 			defer close(mergedChannel)
 			defer s.Close()
 			for {
@@ -285,6 +312,9 @@ func (p *TierPriorityPolicy) MergeRequestChannels(channels []pipeline.RequestCha
 				if chMeta.InferenceObjective != "" {
 					headers["x-gateway-inference-objective"] = chMeta.InferenceObjective
 				}
+				// Stamped before the caller's headers are merged in so that a
+				// caller-supplied fairness header wins.
+				fairnessStamper.Stamp(headers, ir.PublicRequest)
 				for k, v := range ir.PublicRequest.ReqHeaders() {
 					headers[k] = v
 				}
@@ -303,7 +333,7 @@ func (p *TierPriorityPolicy) MergeRequestChannels(channels []pipeline.RequestCha
 				metrics.IncQueueDepth(ir.QueueID, ir.RequestQueueName, workerPoolID)
 				mergedChannel <- erm
 			}
-		}(workerPoolID, s, mergedChannel, p.priorityHeader, p.tierLabel)
+		}(workerPoolID, s, mergedChannel, p.priorityHeader, p.tierLabel, p.fairness)
 	}
 
 	return dispatch

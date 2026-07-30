@@ -77,7 +77,7 @@ func TestRedisImpl(t *testing.T) {
 			Workers: 1,
 		},
 	}
-	dispatch := randomrobin.NewRandomRobinPolicy("test").MergeRequestChannels(flow.RequestChannels(), pools)
+	dispatch := randomrobin.NewRandomRobinPolicy("test", randomrobin.Config{}).MergeRequestChannels(flow.RequestChannels(), pools)
 	mergedChannel := dispatch.Channels["default"]
 
 	select {
