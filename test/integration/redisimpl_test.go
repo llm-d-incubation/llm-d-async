@@ -22,20 +22,24 @@ func TestRedisImpl(t *testing.T) {
 
 	ctx := context.Background()
 
-	flowOpts := redis.PubSubFlowOptions{
-		IGWBaseURL:       "http://localhost:30800",
-		RequestPathURL:   "/v1/completions",
-		RequestQueueName: "request-queue",
-		RetryQueueName:   "retry-sortedset",
-		ResultQueueName:  "result-queue",
+	cfg := redis.PubSubConfig{
+		URL:             redisURL,
+		RetryQueueName:  "retry-sortedset",
+		ResultQueueName: "result-queue",
+		Queues: []redis.QueueConfig{{
+			QueueName:      "request-queue",
+			WorkerPoolID:   "default",
+			RequestPathURL: "/v1/completions",
+			IGWBaseURL:     "http://localhost:30800",
+		}},
 	}
-	connOpts := redis.ConnectionOptions{URL: redisURL}
-	flow, err := redis.NewRedisMQFlow(flowOpts, connOpts, redis.WithWorkerPools([]pipeline.WorkerPoolConfig{
+	cfg.ApplyDefaults()
+	flow, err := redis.NewRedisMQFlow(cfg, []pipeline.WorkerPoolConfig{
 		{
 			ID:      "default",
 			Workers: 1,
 		},
-	}))
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,22 +102,25 @@ func TestRedisImplWithAuth(t *testing.T) {
 
 	ctx := context.Background()
 
-	flowOpts := redis.SortedSetFlowOptions{
-		IGWBaseURL:       "http://localhost:30800",
-		RequestPathURL:   "/v1/completions",
-		RequestQueueName: "request-sortedset",
-		ResultQueueName:  "result-list",
-		PollIntervalMs:   1000,
-		BatchSize:        10,
-		GateParamsJSON:   "{}",
+	cfg := redis.SortedSetConfig{
+		URL:             redisURL,
+		ResultQueueName: "result-list",
+		PollIntervalMs:  1000,
+		BatchSize:       10,
+		Queues: []redis.SortedSetQueueConfig{{
+			QueueName:      "request-sortedset",
+			WorkerPoolID:   "default",
+			RequestPathURL: "/v1/completions",
+			IGWBaseURL:     "http://localhost:30800",
+		}},
 	}
-	connOpts := redis.ConnectionOptions{URL: redisURL}
-	flow, err := redis.NewRedisSortedSetFlow(flowOpts, connOpts, redis.WithSortedSetWorkerPools([]pipeline.WorkerPoolConfig{
+	cfg.ApplyDefaults()
+	flow, err := redis.NewRedisSortedSetFlow(cfg, []pipeline.WorkerPoolConfig{
 		{
 			ID:      "default",
 			Workers: 1,
 		},
-	}))
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

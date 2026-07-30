@@ -147,87 +147,54 @@ func TestNewGCPPubSubMQFlow_PoolRequiredAndValidation(t *testing.T) {
 		}
 	}()
 
-	tmpFile, err := os.CreateTemp("", "topics-config-*.json")
-	if err != nil {
-		t.Fatalf("Failed to create temp file: %v", err)
+	newCfg := func(jsonStr string) Config {
+		var topics []TopicConfig
+		if err := json.Unmarshal([]byte(jsonStr), &topics); err != nil {
+			t.Fatalf("Failed to parse topics: %v", err)
+		}
+		cfg := Config{ProjectID: "test-project", Topics: topics}
+		cfg.ApplyDefaults()
+		return cfg
 	}
-	defer func() { _ = os.Remove(tmpFile.Name()) }()
-
-	baseOpts := Options{ProjectID: "test-project"}
 
 	// Case 1: worker_pool_id is missing, and pool "default" does not exist
-	missingPoolConfig := `[{"subscriber_id":"sub-1","inference_objective":"obj","igw_base_url":"http://gw"}]`
-	if err := os.WriteFile(tmpFile.Name(), []byte(missingPoolConfig), 0644); err != nil {
-		t.Fatalf("Failed to write config: %v", err)
-	}
-	opts := baseOpts
-	opts.TopicsConfigFile = tmpFile.Name()
-
-	_, err = NewGCPPubSubMQFlow(opts, WithWorkerPools([]pipeline.WorkerPoolConfig{{ID: "test-pool", Workers: 1}}))
+	cfg := newCfg(`[{"subscriber_id":"sub-1","inference_objective":"obj","igw_base_url":"http://gw"}]`)
+	_, err := NewGCPPubSubMQFlow(cfg, []pipeline.WorkerPoolConfig{{ID: "test-pool", Workers: 1}}, nil)
 	if err == nil || !strings.Contains(err.Error(), "not found in pool configuration") {
 		t.Errorf("Expected error about missing pool, got: %v", err)
 	}
 
 	// Case 5: worker_pool_id is missing, but only a single 'default' pool is specified
-	if err := os.WriteFile(tmpFile.Name(), []byte(missingPoolConfig), 0644); err != nil {
-		t.Fatalf("Failed to write config: %v", err)
-	}
-	opts = baseOpts
-	opts.TopicsConfigFile = tmpFile.Name()
-
-	_, err = NewGCPPubSubMQFlow(opts, WithWorkerPools([]pipeline.WorkerPoolConfig{{ID: "default", Workers: 1}}))
+	cfg = newCfg(`[{"subscriber_id":"sub-1","inference_objective":"obj","igw_base_url":"http://gw"}]`)
+	_, err = NewGCPPubSubMQFlow(cfg, []pipeline.WorkerPoolConfig{{ID: "default", Workers: 1}}, nil)
 	if err != nil {
 		t.Errorf("Unexpected error when worker_pool_id is missing but default pool exists: %v", err)
 	}
 
 	// Case 6: worker_pool_id is specified as custom, but only a single 'default' pool is specified
-	customPoolConfig := `[{"subscriber_id":"sub-1","worker_pool_id":"custom-pool","inference_objective":"obj","igw_base_url":"http://gw"}]`
-	if err := os.WriteFile(tmpFile.Name(), []byte(customPoolConfig), 0644); err != nil {
-		t.Fatalf("Failed to write config: %v", err)
-	}
-	opts = baseOpts
-	opts.TopicsConfigFile = tmpFile.Name()
-
-	_, err = NewGCPPubSubMQFlow(opts, WithWorkerPools([]pipeline.WorkerPoolConfig{{ID: "default", Workers: 1}}))
+	cfg = newCfg(`[{"subscriber_id":"sub-1","worker_pool_id":"custom-pool","inference_objective":"obj","igw_base_url":"http://gw"}]`)
+	_, err = NewGCPPubSubMQFlow(cfg, []pipeline.WorkerPoolConfig{{ID: "default", Workers: 1}}, nil)
 	if err == nil {
 		t.Error("Expected error when worker_pool_id is custom but only default pool exists")
 	}
 
 	// Case 2: worker_pool_id specified but pool does not exist
-	nonExistentPoolConfig := `[{"subscriber_id":"sub-1","worker_pool_id":"non-existent","inference_objective":"obj","igw_base_url":"http://gw"}]`
-	if err := os.WriteFile(tmpFile.Name(), []byte(nonExistentPoolConfig), 0644); err != nil {
-		t.Fatalf("Failed to write config: %v", err)
-	}
-	opts = baseOpts
-	opts.TopicsConfigFile = tmpFile.Name()
-
-	_, err = NewGCPPubSubMQFlow(opts, WithWorkerPools([]pipeline.WorkerPoolConfig{{ID: "test-pool", Workers: 1}}))
+	cfg = newCfg(`[{"subscriber_id":"sub-1","worker_pool_id":"non-existent","inference_objective":"obj","igw_base_url":"http://gw"}]`)
+	_, err = NewGCPPubSubMQFlow(cfg, []pipeline.WorkerPoolConfig{{ID: "test-pool", Workers: 1}}, nil)
 	if err == nil || !strings.Contains(err.Error(), "not found in pool configuration") {
 		t.Errorf("Expected error about missing pool, got: %v", err)
 	}
 
 	// Case 3: worker_pool_id specified and pool exists, but igw_base_url is missing
-	missingIgwConfig := `[{"subscriber_id":"sub-1","worker_pool_id":"test-pool","inference_objective":"obj"}]`
-	if err := os.WriteFile(tmpFile.Name(), []byte(missingIgwConfig), 0644); err != nil {
-		t.Fatalf("Failed to write config: %v", err)
-	}
-	opts = baseOpts
-	opts.TopicsConfigFile = tmpFile.Name()
-
-	_, err = NewGCPPubSubMQFlow(opts, WithWorkerPools([]pipeline.WorkerPoolConfig{{ID: "test-pool", Workers: 1}}))
+	cfg = newCfg(`[{"subscriber_id":"sub-1","worker_pool_id":"test-pool","inference_objective":"obj"}]`)
+	_, err = NewGCPPubSubMQFlow(cfg, []pipeline.WorkerPoolConfig{{ID: "test-pool", Workers: 1}}, nil)
 	if err == nil || !strings.Contains(err.Error(), "igw_base_url must be specified") {
 		t.Errorf("Expected error about missing igw_base_url, got: %v", err)
 	}
 
 	// Case 4: worker_pool_id and igw_base_url specified and pool exists
-	validConfig := `[{"subscriber_id":"sub-1","worker_pool_id":"test-pool","inference_objective":"obj","igw_base_url":"http://gw"}]`
-	if err := os.WriteFile(tmpFile.Name(), []byte(validConfig), 0644); err != nil {
-		t.Fatalf("Failed to write config: %v", err)
-	}
-	opts = baseOpts
-	opts.TopicsConfigFile = tmpFile.Name()
-
-	_, err = NewGCPPubSubMQFlow(opts, WithWorkerPools([]pipeline.WorkerPoolConfig{{ID: "test-pool", Workers: 1}}))
+	cfg = newCfg(`[{"subscriber_id":"sub-1","worker_pool_id":"test-pool","inference_objective":"obj","igw_base_url":"http://gw"}]`)
+	_, err = NewGCPPubSubMQFlow(cfg, []pipeline.WorkerPoolConfig{{ID: "test-pool", Workers: 1}}, nil)
 	if err != nil {
 		t.Errorf("Unexpected error when worker_pool_id and igw_base_url exist: %v", err)
 	}

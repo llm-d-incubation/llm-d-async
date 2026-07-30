@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"os"
 	"sync"
 	"time"
 
@@ -85,60 +84,28 @@ type RequestChannelData struct {
 	labels         map[string]string
 }
 
-// PubSubOption is a functional option for configuring PubSubMQFlow
-type PubSubOption func(*PubSubMQFlow)
-
-// WithGateFactory sets a GateFactory for per-topic gate instantiation.
-// When set, gates are created per topic from config, overriding any global gate.
-func WithGateFactory(factory pipeline.GateFactory) PubSubOption {
-	return func(p *PubSubMQFlow) {
-		p.gateFactory = factory
-	}
-}
-
-// WithWorkerPools sets the pool configurations to resolve named pools.
-func WithWorkerPools(workerPools []pipeline.WorkerPoolConfig) PubSubOption {
-	return func(p *PubSubMQFlow) {
-		p.workerPools = workerPools
-	}
-}
-
-func NewGCPPubSubMQFlow(pubsubOpts Options, fns ...PubSubOption) (*PubSubMQFlow, error) {
-
+// NewGCPPubSubMQFlow builds a GCP Pub/Sub flow from a parsed Config. The config
+// is expected to have had ApplyDefaults applied (LoadConfig does this).
+// workerPools resolves the named pool each topic routes to; gateFactory, when
+// non-nil, instantiates a per-topic gate for any topic that declares a gate_type.
+func NewGCPPubSubMQFlow(cfg Config, workerPools []pipeline.WorkerPoolConfig, gateFactory pipeline.GateFactory) (*PubSubMQFlow, error) {
 	ctx := context.Background()
 	var err error
-	pubSubClient, err = pubsub.NewClient(ctx, pubsubOpts.ProjectID)
+	pubSubClient, err = pubsub.NewClient(ctx, cfg.ProjectID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create PubSub client: %w", err)
 	}
-	var configs []TopicConfig
-	if pubsubOpts.TopicsConfigFile != "" {
-		data, err := os.ReadFile(pubsubOpts.TopicsConfigFile)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read topics config file: %w", err)
-		}
-
-		if err := json.Unmarshal(data, &configs); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal topics config: %w", err)
-		}
-	} else {
-		configs = []TopicConfig{{
-			SubscriberID:       pubsubOpts.RequestSubscriberID,
-			WorkerPoolID:       "default",
-			InferenceObjective: pubsubOpts.InferenceObjective,
-			IGWBaseURL:         pubsubOpts.IGWBaseURL,
-			RequestPathURL:     pubsubOpts.RequestPathURL,
-		}}
-	}
 	p := &PubSubMQFlow{
-		resultTopicID:   pubsubOpts.ResultTopicID,
-		requestChannels: make([]RequestChannelData, 0, len(configs)),
+		resultTopicID:   cfg.ResultTopicID,
+		requestChannels: make([]RequestChannelData, 0, len(cfg.Topics)),
 		retryChannel:    make(chan pipeline.RetryMessage),
 		resultChannel:   make(chan api.ResultMessage),
-		batchSize:       pubsubOpts.BatchSize,
-		projectID:       pubsubOpts.ProjectID,
+		batchSize:       cfg.BatchSize,
+		projectID:       cfg.ProjectID,
 		client:          pubSubClient,
-		consumeHealth:   make(map[string]*subHealth, len(configs)),
+		consumeHealth:   make(map[string]*subHealth, len(cfg.Topics)),
+		workerPools:     workerPools,
+		gateFactory:     gateFactory,
 	}
 
 	if metricClient, mErr := monitoring.NewMetricClient(ctx); mErr != nil {
@@ -147,12 +114,8 @@ func NewGCPPubSubMQFlow(pubsubOpts Options, fns ...PubSubOption) (*PubSubMQFlow,
 		p.metricClient = metricClient
 	}
 
-	for _, fn := range fns {
-		fn(p)
-	}
-
 	// Create per-topic channels with gates
-	for _, cfg := range configs {
+	for _, cfg := range cfg.Topics {
 		workerPoolID := cfg.WorkerPoolID
 		if workerPoolID == "" {
 			workerPoolID = "default"

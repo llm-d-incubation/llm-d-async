@@ -87,6 +87,7 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 	setupLog.Info("Async Processor starting", "version", version.Version, "commit", version.Commit, "buildDate", version.BuildDate)
 
 	printAllFlags(setupLog)
+	opts.WarnDeprecatedFlags(setupLog)
 
 	poolsMap, totalConcurrency, err := loadWorkerPools(opts.Worker, setupLog)
 	if err != nil {
@@ -96,7 +97,7 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 	gateFactory = flowcontrol.NewGateFactoryWithCacheTTL(opts.Prometheus.URL, opts.Prometheus.CacheTTL).
 		WithLogger(setupLog)
 
-	policy, err := loadRequestMergePolicy(opts.Queue.MergePolicyConfigFile, ctx)
+	policy, err := loadRequestMergePolicy(opts.mergePolicyConfigFile(), ctx)
 	if err != nil {
 		return err
 	}
@@ -173,10 +174,10 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 	flow.Start(ctx)
 	healthServer.SetReady()
 
-	if reporter, ok := flow.(pipeline.BacklogReporter); ok && opts.Queue.BacklogPollInterval > 0 {
-		go pollBacklog(ctx, reporter, opts.Queue.BacklogPollInterval)
+	if reporter, ok := flow.(pipeline.BacklogReporter); ok && opts.Transport.BacklogPollInterval > 0 {
+		go pollBacklog(ctx, reporter, opts.Transport.BacklogPollInterval)
 	} else if !ok {
-		setupLog.Info("Selected flow does not support broker backlog metrics", "message-queue-impl", opts.Queue.Impl)
+		setupLog.Info("Selected flow does not support broker backlog metrics", "transport", opts.effectiveTransportType())
 	}
 
 	<-ctx.Done()
@@ -277,17 +278,33 @@ func loadFlow(opts *Options, gateFactory *flowcontrol.GateFactory, poolsMap map[
 	for _, p := range poolsMap {
 		workerPools = append(workerPools, p)
 	}
-	switch opts.Queue.Impl {
+
+	transportType, configBytes, err := opts.resolveTransport()
+	if err != nil {
+		return nil, err
+	}
+
+	switch transportType {
 	case "redis-pubsub":
-		return redis.NewRedisMQFlow(opts.Redis, opts.RedisConnection, redis.WithRedisTracing(opts.Observability.RedisTracing), redis.WithWorkerPools(workerPools))
+		cfg, err := redis.LoadPubSubConfig(configBytes)
+		if err != nil {
+			return nil, err
+		}
+		return redis.NewRedisMQFlow(*cfg, workerPools)
 	case "redis-sortedset":
-		return redis.NewRedisSortedSetFlow(opts.RedisSortedSet, opts.RedisConnection, redis.WithGateFactory(gateFactory), redis.WithSortedSetRedisTracing(opts.Observability.RedisTracing), redis.WithSortedSetWorkerPools(workerPools))
+		cfg, err := redis.LoadSortedSetConfig(configBytes)
+		if err != nil {
+			return nil, err
+		}
+		return redis.NewRedisSortedSetFlow(*cfg, workerPools, gateFactory)
 	case "gcp-pubsub":
-		return pubsub.NewGCPPubSubMQFlow(opts.PubSub, pubsub.WithWorkerPools(workerPools))
-	case "gcp-pubsub-gated":
-		return pubsub.NewGCPPubSubMQFlow(opts.PubSub, pubsub.WithGateFactory(gateFactory), pubsub.WithWorkerPools(workerPools))
+		cfg, err := pubsub.LoadConfig(configBytes)
+		if err != nil {
+			return nil, err
+		}
+		return pubsub.NewGCPPubSubMQFlow(*cfg, workerPools, gateFactory)
 	default:
-		return nil, fmt.Errorf("unknown message queue implementation: %s", opts.Queue.Impl)
+		return nil, fmt.Errorf("unknown transport: %s", transportType)
 	}
 }
 
@@ -436,6 +453,8 @@ func pollBacklog(ctx context.Context, reporter pipeline.BacklogReporter, interva
 
 var sensitiveFlags = map[string]bool{
 	"redis.url": true,
+	// transport-config may embed a connection URL with credentials.
+	"transport-config": true,
 }
 
 func printAllFlags(setupLog logr.Logger) {

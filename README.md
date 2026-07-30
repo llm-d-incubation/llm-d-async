@@ -35,6 +35,7 @@ The architecture adheres to the following core principles:
   - [Backend Compatibility](#backend-compatibility)
   - [Deployment](#deployment)
   - [Command line parameters](#command-line-parameters)
+  - [Transport Configuration](#transport-configuration)
   - [Dispatch Gates](#dispatch-gates)
     - [Per-Queue Dispatch Gates](#per-queue-dispatch-gates)
   - [Request Messages and Consumption](#request-messages-and-consumption)
@@ -62,9 +63,9 @@ The architecture adheres to the following core principles:
 
 The Async Processor uses the Redis wire protocol for its message queue implementations (`redis-sortedset`, `redis-pubsub`) and dispatch gates (`redis`, `redis-quota`). Redis-protocol-compatible backends such as [Valkey](https://valkey.io/) can be used with the existing Redis configuration surface.
 
-All `--redis.*` CLI flags, Helm values, and environment variables (e.g. `REDIS_URL`) work unchanged with Valkey — point them at your Valkey endpoint the same way you would with Redis.
+The `url` field in the transport configuration (see [Transport Configuration](#transport-configuration)), the `REDIS_URL` environment variable, and the deprecated `--redis.*` CLI flags all work unchanged with Valkey — point them at your Valkey endpoint the same way you would with Redis.
 
-> **Note:** CLI flags and Helm values retain the `redis.*` prefix because it refers to the wire protocol, not a specific product.
+> **Note:** The `url`/`redis.*` naming is retained because it refers to the wire protocol, not a specific product.
 
 ## Deployment
 
@@ -95,8 +96,10 @@ make deploy-ap-on-k8s
 
 ## Command line parameters
 - `concurrency`: The number of concurrent workers (per pool if unspecified), default is 64. The processor is I/O-bound (each worker holds one in-flight request for its full duration), so by Little's Law in-flight concurrency caps throughput — tune this to your backend's latency/throughput target (see the [Async Processor Operations Guide](https://github.com/llm-d/llm-d/blob/main/docs/operations/async-processor.md)).
-- `request-merge-policy-config`: Path to the JSON configuration file containing the request merge policy specification (`type` and `parameters`). If not specified, defaults to the `random-robin` policy.
-- `message-queue-impl`: Implementation of the queueing system. Options are <u>gcp-pubsub</u> for GCP PubSub, <u>gcp-pubsub-gated</u> for GCP PubSub with per-topic gating, <u>redis-sortedset</u> for Redis Sorted Set (persisted and sorted), and <u>redis-pubsub</u> for ephemeral Redis-based implementation.
+- `transport`: The transport (message queue) implementation to use. One of <u>redis-pubsub</u> (ephemeral Redis channels), <u>redis-sortedset</u> (persisted, priority-sorted Redis), and <u>gcp-pubsub</u> (GCP Pub/Sub). Default <u>redis-pubsub</u>. Gating is configured per queue/topic via `gate_type` in the transport config (this replaces the former `gcp-pubsub-gated` implementation).
+- `transport-config`: Inline JSON transport configuration. See [Transport Configuration](#transport-configuration). Mutually exclusive with `transport-config-file`.
+- `transport-config-file`: Path to a JSON file with the transport configuration. Mutually exclusive with `transport-config`.
+- `request-merge-policy-config-file`: Path to the JSON configuration file containing the request merge policy specification (`type` and `parameters`). If not specified, defaults to the `random-robin` policy.
 - `pool-config-file`: Path to the JSON configuration file containing the worker pool definitions. If omitted, a single `"default"` worker pool is created with concurrency determined by the global `concurrency` flag.
 
  - `prometheus-url`: Prometheus server URL for metric-based gates (e.g., http://localhost:9090). For Google Managed Prometheus (GMP), point this to a local proxy or GMP frontend that handles authentication — direct GMP URLs are not supported as the Async Processor does not perform GMP authentication.
@@ -104,6 +107,49 @@ make deploy-ap-on-k8s
  - `prometheus-cache-ttl`: TTL for cached Prometheus metric sources (e.g. 1m, 0s to disable). Default is 5s. Increasing this reduces Prometheus load but also reduces the responsiveness of dispatch gates to metric changes.
 
 <i>additional parameters may be specified for concrete message queue implementations</i>
+
+## Transport Configuration
+
+The transport (message queue) is selected with `--transport` and configured with a single JSON document, supplied either inline via `--transport-config` or from a file via `--transport-config-file` (the two are mutually exclusive; exactly one is required). This is the recommended configuration surface for all backends.
+
+The JSON document is transport-specific. Its `queues`/`topics` entries use the same per-entry fields documented under each implementation below ([Multiple Queues Configuration File Syntax](#multiple-queues-configuration-file-syntax), [Multiple Topics Configuration File Syntax](#multiple-topics-configuration-file-syntax)).
+
+**`redis-pubsub`:**
+```json
+{
+  "url": "redis://user:pass@host:6379/0",
+  "retry_queue_name": "retry-sortedset",
+  "result_queue_name": "result-queue",
+  "enable_tracing": false,
+  "queues": [ { "queue_name": "request-queue", "igw_base_url": "http://localhost:30800" } ]
+}
+```
+
+**`redis-sortedset`:**
+```json
+{
+  "url": "redis://user:pass@host:6379/0",
+  "result_queue_name": "result-list",
+  "poll_interval_ms": 1000,
+  "batch_size": 10,
+  "enable_tracing": false,
+  "queues": [ { "queue_name": "request-sortedset", "igw_base_url": "http://localhost:30800", "gate_type": "redis", "gate_params": { "address": "localhost:6379" } } ]
+}
+```
+
+**`gcp-pubsub`:**
+```json
+{
+  "project_id": "my-project",
+  "result_topic_id": "results",
+  "batch_size": 10,
+  "topics": [ { "subscriber_id": "requests-sub", "igw_base_url": "http://localhost:30800", "gate_type": "constant", "gate_params": {} } ]
+}
+```
+
+The `url` field honors the `REDIS_URL` environment variable as an override for the Redis transports. Per-queue/topic dispatch gates are configured with the `gate_type`/`gate_params` fields (see [Dispatch Gates](#dispatch-gates)).
+
+> **Deprecated:** The per-backend flags — `--message-queue-impl`, `--redis.url`, `--redis.*`, `--redis.ss.*`, `--pubsub.*`, `--redis-tracing`, and `--request-merge-policy-config` — still work for backwards compatibility but are deprecated. When used, the processor logs a warning and translates them into the transport config above. `--transport`/`--transport-config` take precedence when both are set. Prefer the new flags.
 
 ## Worker Pools Configuration
 
@@ -440,7 +486,7 @@ This per-pool topology provides complete backpressure and queue-level isolation:
 
 #### Configuration
 
-The merge policy is configured using the `--request-merge-policy-config` CLI flag. It points to a JSON configuration file specifying the policy `type` and optional custom `parameters`:
+The merge policy is configured using the `--request-merge-policy-config-file` CLI flag (the older `--request-merge-policy-config` name is a deprecated alias). It points to a JSON configuration file specifying the policy `type` and optional custom `parameters`:
 
 ```json
 {
@@ -559,7 +605,7 @@ Tracing is controlled via standard OpenTelemetry environment variables. Set `OTE
 
 **CLI flag:**
 
-- `--redis-tracing`: Enable per-command Redis tracing spans via `redisotel`. Produces high span volume — use only for debugging. Default: `false`.
+- `enable_tracing` (transport config): Enable per-command Redis tracing spans via `redisotel`. Produces high span volume — use only for debugging. Default: `false`. Set it in the Redis `--transport-config` (the older `--redis-tracing` CLI flag is a deprecated alias).
 
 **Helm chart:**
 
@@ -687,6 +733,9 @@ A persisted implementation based on Redis SortedSets.
 ![Async Processor - Redis Sorted Set architecture](/docs/images/redis_sortedset_architecture.png "AP - Redis SortedSet")
 
 #### Redis Sorted Set Command line parameters
+
+> **Deprecated:** Prefer `--transport redis-sortedset` with `--transport-config`/`--transport-config-file` (see [Transport Configuration](#transport-configuration)). The `--redis.ss.*` and `--redis.url` flags below still work but are deprecated aliases translated into the transport config: `--redis.url` → `url`, `--redis.ss.poll-interval-ms` → `poll_interval_ms`, `--redis.ss.batch-size` → `batch_size`, `--redis.ss.result-queue-name` → `result_queue_name`, and the single-queue `--redis.ss.igw-base-url`/`--redis.ss.request-queue-name`/`--redis.ss.request-path-url`/`--redis.ss.inference-objective`/`--redis.ss.gate-type`/`--redis.ss.gate-params` (or `--redis.ss.queues-config`/`--redis.ss.queues-config-file`) → the `queues` array.
+
 - `redis.url`: Redis/Valkey URL (e.g. `redis://user:pass@host:port/db` or `rediss://...` for TLS). Supports Redis-protocol-compatible backends such as Valkey. Can also be set via `REDIS_URL` env var.
 - `redis.ss.igw-base-url`: Base URL of the IGW (e.g. https://localhost:30800).<br> Mutually exclusive with `redis.ss.queues-config-file` flag.
 - `redis.ss.request-path-url`: Request path url (e.g.: "/v1/completions"). <br> Mutually exclusive with `redis.ss.queues-config-file` flag.")
@@ -714,6 +763,8 @@ An example implementation based on Redis channels is provided.
 ![Async Processor - Redis architecture](/docs/images/redis_pubsub_architecture.png "AP - Redis")
 
 #### Redis Channels Command line parameters
+
+> **Deprecated:** Prefer `--transport redis-pubsub` with `--transport-config`/`--transport-config-file` (see [Transport Configuration](#transport-configuration)). The `--redis.*` and `--redis.url` flags below still work but are deprecated aliases translated into the transport config: `--redis.url` → `url`, `--redis.retry-queue-name` → `retry_queue_name`, `--redis.result-queue-name` → `result_queue_name`, and the single-queue `--redis.igw-base-url`/`--redis.request-queue-name`/`--redis.request-path-url`/`--redis.inference-objective` (or `--redis.queues-config`/`--redis.queues-config-file`) → the `queues` array.
 
 - `redis.url`: Redis/Valkey URL (e.g. `redis://user:pass@host:port/db` or `rediss://...` for TLS). Supports Redis-protocol-compatible backends such as Valkey. Can also be set via `REDIS_URL` env var.
 - `redis.igw-base-url`: Base URL of the IGW (e.g. https://localhost:30800).<br> Mutually exclusive with `redis.queues-config-file` flag.
@@ -777,6 +828,8 @@ The GCP PubSub implementation requires the user to configure the following:
 ![Async Processor - GCP PubSub Architecture](/docs/images/gcp_pubsub_architecture.png "AP - GCP PubSub")
 
 #### GCP PubSub Command line parameters
+
+> **Deprecated:** Prefer `--transport gcp-pubsub` with `--transport-config`/`--transport-config-file` (see [Transport Configuration](#transport-configuration)). The `--pubsub.*` flags below still work but are deprecated aliases translated into the transport config: `--pubsub.project-id` → `project_id`, `--pubsub.result-topic-id` → `result_topic_id`, `--pubsub.batch-size` → `batch_size`, and the single-topic `--pubsub.request-subscriber-id`/`--pubsub.igw-base-url`/`--pubsub.request-path-url`/`--pubsub.inference-objective` (or `--pubsub.topics-config-file`) → the `topics` array. Per-topic gating (formerly the `gcp-pubsub-gated` implementation) is now configured with `gate_type`/`gate_params` in each topic entry.
 
 - `pubsub.project-id`: The name GCP project ID using the PubSub API.
 - `pubsub.igw-base-url`: Base URL of the IGW (e.g. https://localhost:30800).<br> Mutually exclusive with `pubsub.topics-config-file` flag.

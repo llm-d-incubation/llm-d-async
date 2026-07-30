@@ -1,0 +1,257 @@
+package server
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/go-logr/logr/funcr"
+	"github.com/llm-d/llm-d-async/pkg/pubsub"
+	"github.com/llm-d/llm-d-async/pkg/redis"
+	"github.com/spf13/pflag"
+)
+
+// newTestOptions builds an Options with a fresh flag set parsed from args, so
+// tests exercise the same fs.Changed bookkeeping the real CLI relies on.
+func newTestOptions(t *testing.T, args ...string) *Options {
+	t.Helper()
+	o := NewOptions()
+	fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
+	o.AddFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
+	return o
+}
+
+func TestSynthesizeRedisPubSubConfig_SingleQueue(t *testing.T) {
+	o := newTestOptions(t,
+		"--message-queue-impl=redis-pubsub",
+		"--redis.url=redis://localhost:6379",
+		"--redis.igw-base-url=http://gw",
+		"--redis.request-queue-name=my-queue",
+		"--redis.retry-queue-name=my-retry",
+		"--redis.result-queue-name=my-result",
+		"--redis-tracing",
+	)
+
+	data, err := o.synthesizeRedisPubSubConfig()
+	if err != nil {
+		t.Fatalf("synthesizeRedisPubSubConfig: %v", err)
+	}
+	var cfg redis.PubSubConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal synthesized config: %v", err)
+	}
+
+	if cfg.URL != "redis://localhost:6379" {
+		t.Errorf("URL = %q, want redis://localhost:6379", cfg.URL)
+	}
+	if cfg.RetryQueueName != "my-retry" || cfg.ResultQueueName != "my-result" {
+		t.Errorf("queue names = %q/%q, want my-retry/my-result", cfg.RetryQueueName, cfg.ResultQueueName)
+	}
+	if !cfg.EnableTracing {
+		t.Error("EnableTracing = false, want true (from --redis-tracing)")
+	}
+	if len(cfg.Queues) != 1 || cfg.Queues[0].QueueName != "my-queue" || cfg.Queues[0].IGWBaseURL != "http://gw" {
+		t.Errorf("queues = %+v, want single my-queue/http://gw", cfg.Queues)
+	}
+
+	// The synthesized blob must satisfy the real loader end to end.
+	if _, err := redis.LoadPubSubConfig(data); err != nil {
+		t.Errorf("LoadPubSubConfig rejected synthesized config: %v", err)
+	}
+}
+
+func TestSynthesizeRedisSortedSetConfig_SingleQueueGate(t *testing.T) {
+	o := newTestOptions(t,
+		"--message-queue-impl=redis-sortedset",
+		"--redis.url=redis://localhost:6379",
+		"--redis.ss.igw-base-url=http://gw",
+		"--redis.ss.request-queue-name=ss-queue",
+		"--redis.ss.gate-type=prometheus-saturation",
+		"--redis.ss.gate-params={\"threshold\":0.7}",
+	)
+
+	data, err := o.synthesizeRedisSortedSetConfig()
+	if err != nil {
+		t.Fatalf("synthesizeRedisSortedSetConfig: %v", err)
+	}
+	var cfg redis.SortedSetConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal synthesized config: %v", err)
+	}
+	if len(cfg.Queues) != 1 {
+		t.Fatalf("queues = %+v, want 1", cfg.Queues)
+	}
+	q := cfg.Queues[0]
+	if q.QueueName != "ss-queue" || q.IGWBaseURL != "http://gw" {
+		t.Errorf("queue = %+v, want ss-queue/http://gw", q)
+	}
+	if q.GateType != "prometheus-saturation" {
+		t.Errorf("GateType = %q, want prometheus-saturation", q.GateType)
+	}
+	if q.GateParams["threshold"] != 0.7 {
+		t.Errorf("GateParams[threshold] = %v, want 0.7", q.GateParams["threshold"])
+	}
+}
+
+func TestSynthesizePubSubConfig_SingleTopic(t *testing.T) {
+	o := newTestOptions(t,
+		"--message-queue-impl=gcp-pubsub",
+		"--pubsub.project-id=proj",
+		"--pubsub.request-subscriber-id=sub-1",
+		"--pubsub.igw-base-url=http://gw",
+		"--pubsub.result-topic-id=results",
+	)
+
+	data, err := o.synthesizePubSubConfig()
+	if err != nil {
+		t.Fatalf("synthesizePubSubConfig: %v", err)
+	}
+	var cfg pubsub.Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal synthesized config: %v", err)
+	}
+	if cfg.ProjectID != "proj" || cfg.ResultTopicID != "results" {
+		t.Errorf("project/result = %q/%q, want proj/results", cfg.ProjectID, cfg.ResultTopicID)
+	}
+	if len(cfg.Topics) != 1 || cfg.Topics[0].SubscriberID != "sub-1" || cfg.Topics[0].IGWBaseURL != "http://gw" {
+		t.Errorf("topics = %+v, want single sub-1/http://gw", cfg.Topics)
+	}
+	if _, err := pubsub.LoadConfig(data); err != nil {
+		t.Errorf("LoadConfig rejected synthesized config: %v", err)
+	}
+}
+
+func TestResolveTransport_PrefersNewFlags(t *testing.T) {
+	inline := `{"url":"redis://new","queues":[{"queue_name":"q","igw_base_url":"http://gw"}]}`
+	o := newTestOptions(t,
+		"--transport=redis-pubsub",
+		"--transport-config="+inline,
+		// Legacy flags set too; they must be ignored.
+		"--message-queue-impl=gcp-pubsub",
+		"--redis.url=redis://legacy",
+	)
+
+	transportType, data, err := o.resolveTransport()
+	if err != nil {
+		t.Fatalf("resolveTransport: %v", err)
+	}
+	if transportType != "redis-pubsub" {
+		t.Errorf("transportType = %q, want redis-pubsub (new flag wins)", transportType)
+	}
+	if string(data) != inline {
+		t.Errorf("config bytes = %q, want the inline --transport-config", string(data))
+	}
+}
+
+func TestResolveTransport_NormalizesGatedAlias(t *testing.T) {
+	o := newTestOptions(t,
+		"--message-queue-impl=gcp-pubsub-gated",
+		"--pubsub.project-id=proj",
+		"--pubsub.request-subscriber-id=sub-1",
+		"--pubsub.igw-base-url=http://gw",
+	)
+	transportType, _, err := o.resolveTransport()
+	if err != nil {
+		t.Fatalf("resolveTransport: %v", err)
+	}
+	if transportType != "gcp-pubsub" {
+		t.Errorf("transportType = %q, want gcp-pubsub (gated alias normalized)", transportType)
+	}
+}
+
+func TestWarnDeprecatedFlags_LegacyUsed(t *testing.T) {
+	o := newTestOptions(t,
+		"--message-queue-impl=redis-sortedset",
+		"--redis.url=redis://localhost:6379",
+	)
+
+	var msgs []string
+	logger := funcr.New(func(prefix, args string) { msgs = append(msgs, args) }, funcr.Options{})
+	o.WarnDeprecatedFlags(logger)
+
+	joined := strings.Join(msgs, "\n")
+	if !strings.Contains(joined, "--message-queue-impl") || !strings.Contains(joined, "--redis.url") {
+		t.Errorf("expected deprecation warnings for the set legacy flags, got:\n%s", joined)
+	}
+	if strings.Contains(joined, "ignored because") {
+		t.Errorf("legacy-only run should warn about deprecation, not ignore, got:\n%s", joined)
+	}
+}
+
+func TestWarnDeprecatedFlags_IgnoredWhenNewTransport(t *testing.T) {
+	o := newTestOptions(t,
+		"--transport=redis-pubsub",
+		"--transport-config={\"url\":\"redis://new\",\"queues\":[]}",
+		"--redis.url=redis://legacy",
+	)
+
+	var msgs []string
+	logger := funcr.New(func(prefix, args string) { msgs = append(msgs, args) }, funcr.Options{})
+	o.WarnDeprecatedFlags(logger)
+
+	joined := strings.Join(msgs, "\n")
+	if !strings.Contains(joined, "ignored because") || !strings.Contains(joined, "--redis.url") {
+		t.Errorf("expected 'ignored' warning for --redis.url when new transport used, got:\n%s", joined)
+	}
+}
+
+func TestMergePolicyConfigFile_Resolution(t *testing.T) {
+	t.Run("canonical flag", func(t *testing.T) {
+		o := newTestOptions(t, "--request-merge-policy-config-file=/etc/new.json")
+		if got := o.mergePolicyConfigFile(); got != "/etc/new.json" {
+			t.Errorf("mergePolicyConfigFile() = %q, want /etc/new.json", got)
+		}
+	})
+	t.Run("deprecated alias", func(t *testing.T) {
+		o := newTestOptions(t, "--request-merge-policy-config=/etc/old.json")
+		if got := o.mergePolicyConfigFile(); got != "/etc/old.json" {
+			t.Errorf("mergePolicyConfigFile() = %q, want /etc/old.json", got)
+		}
+	})
+	t.Run("canonical wins when both set", func(t *testing.T) {
+		o := newTestOptions(t,
+			"--request-merge-policy-config=/etc/old.json",
+			"--request-merge-policy-config-file=/etc/new.json",
+		)
+		if got := o.mergePolicyConfigFile(); got != "/etc/new.json" {
+			t.Errorf("mergePolicyConfigFile() = %q, want /etc/new.json (canonical wins)", got)
+		}
+	})
+}
+
+func TestWarnDeprecatedFlags_MergePolicyRenameNotIgnored(t *testing.T) {
+	// Even with the new transport flags in use, the merge-policy alias still
+	// works (it is orthogonal to transport), so it must not be reported "ignored".
+	o := newTestOptions(t,
+		"--transport-config={\"url\":\"redis://x\",\"queues\":[]}",
+		"--request-merge-policy-config=/etc/old.json",
+	)
+
+	var msgs []string
+	logger := funcr.New(func(prefix, args string) { msgs = append(msgs, args) }, funcr.Options{})
+	o.WarnDeprecatedFlags(logger)
+
+	joined := strings.Join(msgs, "\n")
+	if !strings.Contains(joined, "--request-merge-policy-config") ||
+		!strings.Contains(joined, "--request-merge-policy-config-file") {
+		t.Errorf("expected rename warning for merge-policy flag, got:\n%s", joined)
+	}
+	if strings.Contains(joined, "ignored because") {
+		t.Errorf("merge-policy flag must not be reported as ignored, got:\n%s", joined)
+	}
+}
+
+func TestWarnDeprecatedFlags_NoneSet(t *testing.T) {
+	o := newTestOptions(t, "--transport-config={\"url\":\"redis://x\",\"queues\":[]}")
+
+	var msgs []string
+	logger := funcr.New(func(prefix, args string) { msgs = append(msgs, args) }, funcr.Options{})
+	o.WarnDeprecatedFlags(logger)
+
+	if len(msgs) != 0 {
+		t.Errorf("expected no deprecation warnings when no deprecated flags set, got:\n%s", strings.Join(msgs, "\n"))
+	}
+}

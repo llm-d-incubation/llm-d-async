@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"sync"
 	"time"
 
@@ -151,67 +150,29 @@ type RedisMQFlow struct {
 	enableTracing   bool
 }
 
-// RedisOption is a functional option for configuring RedisMQFlow.
-type RedisOption func(*RedisMQFlow)
-
-// WithRedisTracing enables per-command Redis tracing spans via redisotel.
-func WithRedisTracing(enable bool) RedisOption {
-	return func(r *RedisMQFlow) {
-		r.enableTracing = enable
-	}
-}
-
-// WithWorkerPools sets the pool configurations to resolve named pools.
-func WithWorkerPools(workerPools []pipeline.WorkerPoolConfig) RedisOption {
-	return func(r *RedisMQFlow) {
-		r.workerPools = workerPools
-	}
-}
-
-func NewRedisMQFlow(flowOpts PubSubFlowOptions, connOpts ConnectionOptions, fns ...RedisOption) (*RedisMQFlow, error) {
-	redisOpts, err := ParseRedisOptions(connOpts.URL)
+// NewRedisMQFlow builds a Redis pub/sub flow from a parsed PubSubConfig.
+// The config is expected to have had ApplyDefaults applied (LoadPubSubConfig
+// does this); workerPools resolves the named pool each queue routes to.
+func NewRedisMQFlow(cfg PubSubConfig, workerPools []pipeline.WorkerPoolConfig) (*RedisMQFlow, error) {
+	redisOpts, err := ParseRedisOptions(cfg.URL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid Redis connection config: %w", err)
 	}
 	rdb := redis.NewClient(redisOpts)
-	var configs []QueueConfig
-	if flowOpts.QueuesConfig != "" {
-		if err := json.Unmarshal([]byte(flowOpts.QueuesConfig), &configs); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal inline queues config: %w", err)
-		}
-	} else if flowOpts.QueuesConfigFile != "" {
-		data, err := os.ReadFile(flowOpts.QueuesConfigFile)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read queues config file: %w", err)
-		}
-		if err := json.Unmarshal(data, &configs); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal queues config: %w", err)
-		}
-	} else {
-		configs = []QueueConfig{{
-			QueueName:          flowOpts.RequestQueueName,
-			WorkerPoolID:       "default",
-			InferenceObjective: flowOpts.InferenceObjective,
-			IGWBaseURL:         flowOpts.IGWBaseURL,
-			RequestPathURL:     flowOpts.RequestPathURL,
-		}}
-	}
 
 	flow := &RedisMQFlow{
 		rdb:             rdb,
 		retryChannel:    make(chan pipeline.RetryMessage),
 		resultChannel:   make(chan api.ResultMessage, resultChannelBuffer),
-		retryQueueName:  flowOpts.RetryQueueName,
-		resultQueueName: flowOpts.ResultQueueName,
-	}
-
-	for _, fn := range fns {
-		fn(flow)
+		retryQueueName:  cfg.RetryQueueName,
+		resultQueueName: cfg.ResultQueueName,
+		workerPools:     workerPools,
+		enableTracing:   cfg.EnableTracing,
 	}
 
 	var channels []RequestChannelData
 
-	for _, cfg := range configs {
+	for _, cfg := range cfg.Queues {
 		ch := make(chan *api.InternalRequest)
 
 		workerPoolID := cfg.WorkerPoolID
