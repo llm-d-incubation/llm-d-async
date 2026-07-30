@@ -56,7 +56,7 @@ func (h *HTTPInferenceClient) SendRequest(ctx context.Context, url string, heade
 
 	body, err := io.ReadAll(result.Body)
 	if err != nil {
-		return &asyncapi.InferenceResponse{StatusCode: result.StatusCode, Body: body}, &asyncapi.ClientError{
+		return &asyncapi.InferenceResponse{StatusCode: result.StatusCode, Body: body, Header: result.Header}, &asyncapi.ClientError{
 			ErrorCategory: asyncapi.ErrCategoryServer,
 			Message:       "failed to read response",
 			RawError:      err,
@@ -66,7 +66,7 @@ func (h *HTTPInferenceClient) SendRequest(ctx context.Context, url string, heade
 		}
 	}
 
-	resp := &asyncapi.InferenceResponse{StatusCode: result.StatusCode, Body: body}
+	resp := &asyncapi.InferenceResponse{StatusCode: result.StatusCode, Body: body, Header: result.Header}
 
 	if result.StatusCode == 429 {
 		return resp, &asyncapi.ClientError{

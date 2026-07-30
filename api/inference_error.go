@@ -43,6 +43,29 @@ var _ InferenceError = (*ClientError)(nil)
 // disconnected, shutting down) responses.
 const DroppedReasonHeader = "x-llm-d-request-dropped-reason"
 
+// DroppedReasonHeader values that outcome classification branches on.
+const (
+	// DroppedReasonSaturated indicates the request was rejected because the pool lacked capacity.
+	DroppedReasonSaturated = "rejected-saturated"
+	// DroppedReasonTTLExpired indicates the request expired in the gateway's queue before dispatch.
+	DroppedReasonTTLExpired = "rejected-ttl-expired"
+	// DroppedReasonEvictedPrefix prefixes all reasons where an admitted request was revoked in flight.
+	DroppedReasonEvictedPrefix = "evicted"
+)
+
+// Advisory capacity-view headers piggybacked on gateway responses. The names
+// are provisional pending ratification of the flow-control contract; a missing
+// header means no signal, and consumers treat the values as samples from the
+// replica that served the response, never as pool truth.
+const (
+	// ViewQueueDurationHeader carries the time the request spent queued before
+	// dispatch, in milliseconds.
+	ViewQueueDurationHeader = "x-llm-d-flow-queue-duration-ms"
+	// ViewBandHeadroomHeader carries the remaining queue capacity, in requests,
+	// of the priority band the request occupied.
+	ViewBandHeadroomHeader = "x-llm-d-flow-band-headroom"
+)
+
 // ClientError represents an inference client error with category and context.
 type ClientError struct {
 	ErrorCategory ErrorCategory
