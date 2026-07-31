@@ -406,20 +406,18 @@ func retryMessage(ctx context.Context, msg pipeline.EmbelishedRequestMessage, re
 	}
 
 	finalDuration := expBackoffDuration(msg.RetryCount+1, int(secondsToDeadline))
-	// Honor server-specified Retry-After when it exceeds the computed backoff,
-	// but never schedule a retry beyond the message deadline.
-	if retryAfterSec := retryAfter.Seconds(); retryAfterSec > finalDuration {
+	// Honor server-specified Retry-After when it exceeds the computed backoff
+	// and still fits the message deadline. A hint beyond the deadline falls
+	// back to the backoff schedule: the server's estimate alone must not
+	// terminate a message that still has retry budget.
+	if retryAfterSec := retryAfter.Seconds(); retryAfterSec > finalDuration && retryAfterSec < float64(secondsToDeadline) {
 		finalDuration = retryAfterSec
 	}
-
-	if finalDuration >= float64(secondsToDeadline) {
-		metrics.RecordExceededDeadlineReq(queueID, queueName, msg.WorkerPoolID)
-		select {
-		case resultChannel <- deadlineExhaustedResult(msg, lastResp):
-		case <-ctx.Done():
-		}
-		return
-	}
+	// Both branches keep finalDuration strictly under secondsToDeadline —
+	// expBackoffDuration caps at min(maxDelaySeconds, secondsToDeadline) and
+	// jitters below that cap — so the retry always lands before the deadline.
+	// The expiry check at the top of this function is therefore the only path
+	// that gives up on a message.
 
 	msg.RetryCount++
 	metrics.RecordRetry(queueID, queueName, msg.WorkerPoolID)
