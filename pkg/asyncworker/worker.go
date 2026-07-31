@@ -117,6 +117,7 @@ func WorkerWithGate(consumeCtx, requestCtx context.Context, characteristics pipe
 
 					var verdict pipeline.Verdict
 					var err error
+					var waitRecorded bool
 					for {
 						if emitCancelledResultIfNeeded(requestCtx, logger, retryChannel, resultChannel, msg, &nextCancellationCheck) {
 							return
@@ -139,6 +140,7 @@ func WorkerWithGate(consumeCtx, requestCtx context.Context, characteristics pipe
 								}
 								return
 							}
+							metrics.RecordGateDecision(metrics.ReasonError, "", "", msg.WorkerPoolID)
 							select {
 							case resultChannel <- asyncapi.NewErrorResult(msg.PublicRequest, msg.InternalRouting, asyncapi.ErrCodeGateError, fmt.Sprintf("Pool gating error: %s", err.Error())):
 							case <-requestCtx.Done():
@@ -151,6 +153,7 @@ func WorkerWithGate(consumeCtx, requestCtx context.Context, characteristics pipe
 						}
 
 						if verdict.Action == pipeline.ActionDrop {
+							metrics.RecordGateDecision(metrics.ReasonDropped, "", "", msg.WorkerPoolID)
 							var resultMsg asyncapi.ResultMessage
 							if verdict.Result != nil {
 								resultMsg = *verdict.Result
@@ -165,6 +168,11 @@ func WorkerWithGate(consumeCtx, requestCtx context.Context, characteristics pipe
 						}
 
 						if verdict.Action == pipeline.ActionRefuse {
+							reason := metrics.ReasonGateClosed
+							if msg.GetClassification() == asyncapi.ClassificationOverflow {
+								reason = metrics.ReasonQuotaExhausted
+							}
+							metrics.RecordGateDecision(reason, "", "", msg.WorkerPoolID)
 							select {
 							case retryChannel <- pipeline.RetryMessage{
 								EmbelishedRequestMessage: msg,
@@ -177,6 +185,14 @@ func WorkerWithGate(consumeCtx, requestCtx context.Context, characteristics pipe
 
 						// ActionWait: park/wait and retry in-memory
 						if verdict.Action == pipeline.ActionWait {
+							if !waitRecorded {
+								reason := metrics.ReasonGateClosed
+								if msg.GetClassification() == asyncapi.ClassificationOverflow {
+									reason = metrics.ReasonQuotaExhausted
+								}
+								metrics.RecordGateDecision(reason, "", "", msg.WorkerPoolID)
+								waitRecorded = true
+							}
 							select {
 							case <-gateCtx.Done():
 								if requestCtx.Err() != nil && !errors.Is(requestCtx.Err(), context.DeadlineExceeded) {

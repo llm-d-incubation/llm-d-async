@@ -150,6 +150,7 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 				os.Exit(1)
 			}
 			poolGates[poolID] = gate
+			metrics.InitGateDecisions("", "", poolID)
 			setupLog.Info("Created pool gate", "poolID", poolID, "gateType", pool.GateType, "gateParams", pool.GateParams)
 		}
 	}

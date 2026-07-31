@@ -2545,3 +2545,223 @@ func TestWorker_QueueGateAndPoolGateRace(t *testing.T) {
 		t.Errorf("expected pool release to be called exactly once, got %d", poolReleaseCalled)
 	}
 }
+
+type mockDecisionPoolGate struct {
+	verdict pipeline.Verdict
+	err     error
+}
+
+func (g *mockDecisionPoolGate) Budget(ctx context.Context) float64 { return 1.0 }
+
+func (g *mockDecisionPoolGate) Apply(ctx context.Context, _ *asyncapi.InternalRequest, _ *[]pipeline.GateReleaseFunc) (pipeline.Verdict, error) {
+	return g.verdict, g.err
+}
+
+func gateDecisionCountForPool(poolID, reason string) float64 {
+	c, err := metrics.GateDecisions.GetMetricWithLabelValues("", "", poolID, reason)
+	if err != nil {
+		return 0
+	}
+	return testutil.ToFloat64(c)
+}
+
+func TestWorker_PoolGateDecisionsMetrics(t *testing.T) {
+	httpclient := NewTestClient(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
+	})
+	inferenceClient := NewHTTPInferenceClient(httpclient)
+
+	t.Run("dropped decision", func(t *testing.T) {
+		poolID := "pool-test-dropped"
+		metrics.InitGateDecisions("", "", poolID)
+		requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+		retryChannel := make(chan pipeline.RetryMessage, 1)
+		resultChannel := make(chan asyncapi.ResultMessage, 1)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		gate := &mockDecisionPoolGate{verdict: pipeline.Drop(nil)}
+		go WorkerWithGate(ctx, ctx, pipeline.Characteristics{}, inferenceClient, requestChannel, retryChannel, resultChannel, defaultRequestTimeout, nil, gate)
+
+		msg := newEmb(asyncapi.RequestMessage{
+			ID:       "req-dropped",
+			Created:  time.Now().Unix(),
+			Deadline: time.Now().Add(30 * time.Second).Unix(),
+			Payload:  map[string]any{"model": "test"},
+		}, "http://localhost:30800/v1/completions", nil)
+		msg.WorkerPoolID = poolID
+		requestChannel <- msg
+
+		select {
+		case <-resultChannel:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for dropped result")
+		}
+
+		if got := gateDecisionCountForPool(poolID, metrics.ReasonDropped); got != 1 {
+			t.Errorf("GateDecisions[dropped] = %v, want 1", got)
+		}
+		for _, reason := range []string{metrics.ReasonGateClosed, metrics.ReasonQuotaExhausted, metrics.ReasonError} {
+			if got := gateDecisionCountForPool(poolID, reason); got != 0 {
+				t.Errorf("GateDecisions[%s] = %v, want 0", reason, got)
+			}
+		}
+	})
+
+	t.Run("refuse decision - gate_closed", func(t *testing.T) {
+		poolID := "pool-test-refused-closed"
+		metrics.InitGateDecisions("", "", poolID)
+		requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+		retryChannel := make(chan pipeline.RetryMessage, 1)
+		resultChannel := make(chan asyncapi.ResultMessage, 1)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		gate := &mockDecisionPoolGate{verdict: pipeline.Refuse()}
+		go WorkerWithGate(ctx, ctx, pipeline.Characteristics{}, inferenceClient, requestChannel, retryChannel, resultChannel, defaultRequestTimeout, nil, gate)
+
+		msg := newEmb(asyncapi.RequestMessage{
+			ID:       "req-closed",
+			Created:  time.Now().Unix(),
+			Deadline: time.Now().Add(30 * time.Second).Unix(),
+			Payload:  map[string]any{"model": "test"},
+		}, "http://localhost:30800/v1/completions", nil)
+		msg.WorkerPoolID = poolID
+		requestChannel <- msg
+
+		select {
+		case <-retryChannel:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for retry message")
+		}
+
+		if got := gateDecisionCountForPool(poolID, metrics.ReasonGateClosed); got != 1 {
+			t.Errorf("GateDecisions[gate_closed] = %v, want 1", got)
+		}
+		for _, reason := range []string{metrics.ReasonDropped, metrics.ReasonQuotaExhausted, metrics.ReasonError} {
+			if got := gateDecisionCountForPool(poolID, reason); got != 0 {
+				t.Errorf("GateDecisions[%s] = %v, want 0", reason, got)
+			}
+		}
+	})
+
+	t.Run("refuse decision - quota_exhausted", func(t *testing.T) {
+		poolID := "pool-test-refused-quota"
+		metrics.InitGateDecisions("", "", poolID)
+		requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+		retryChannel := make(chan pipeline.RetryMessage, 1)
+		resultChannel := make(chan asyncapi.ResultMessage, 1)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		gate := &mockDecisionPoolGate{verdict: pipeline.Refuse()}
+		go WorkerWithGate(ctx, ctx, pipeline.Characteristics{}, inferenceClient, requestChannel, retryChannel, resultChannel, defaultRequestTimeout, nil, gate)
+
+		ir := asyncapi.NewInternalRequest(
+			asyncapi.InternalRouting{RequestQueueName: "test-queue"},
+			&asyncapi.RequestMessage{
+				ID:       "req-quota",
+				Created:  time.Now().Unix(),
+				Deadline: time.Now().Add(30 * time.Second).Unix(),
+				Payload:  map[string]any{"model": "test"},
+			},
+		)
+		ir.SetClassification(asyncapi.ClassificationOverflow)
+
+		requestChannel <- pipeline.EmbelishedRequestMessage{
+			InternalRequest: ir,
+			RequestURL:      "http://localhost:30800/v1/completions",
+			WorkerPoolID:    poolID,
+		}
+
+		select {
+		case <-retryChannel:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for retry message")
+		}
+
+		if got := gateDecisionCountForPool(poolID, metrics.ReasonQuotaExhausted); got != 1 {
+			t.Errorf("GateDecisions[quota_exhausted] = %v, want 1", got)
+		}
+		for _, reason := range []string{metrics.ReasonGateClosed, metrics.ReasonDropped, metrics.ReasonError} {
+			if got := gateDecisionCountForPool(poolID, reason); got != 0 {
+				t.Errorf("GateDecisions[%s] = %v, want 0", reason, got)
+			}
+		}
+	})
+
+	t.Run("error decision", func(t *testing.T) {
+		poolID := "pool-test-error"
+		metrics.InitGateDecisions("", "", poolID)
+		requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+		retryChannel := make(chan pipeline.RetryMessage, 1)
+		resultChannel := make(chan asyncapi.ResultMessage, 1)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		gate := &mockDecisionPoolGate{err: fmt.Errorf("gate failure")}
+		go WorkerWithGate(ctx, ctx, pipeline.Characteristics{}, inferenceClient, requestChannel, retryChannel, resultChannel, defaultRequestTimeout, nil, gate)
+
+		msg := newEmb(asyncapi.RequestMessage{
+			ID:       "req-error",
+			Created:  time.Now().Unix(),
+			Deadline: time.Now().Add(30 * time.Second).Unix(),
+			Payload:  map[string]any{"model": "test"},
+		}, "http://localhost:30800/v1/completions", nil)
+		msg.WorkerPoolID = poolID
+		requestChannel <- msg
+
+		select {
+		case <-resultChannel:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for error result")
+		}
+
+		if got := gateDecisionCountForPool(poolID, metrics.ReasonError); got != 1 {
+			t.Errorf("GateDecisions[error] = %v, want 1", got)
+		}
+		for _, reason := range []string{metrics.ReasonGateClosed, metrics.ReasonQuotaExhausted, metrics.ReasonDropped} {
+			if got := gateDecisionCountForPool(poolID, reason); got != 0 {
+				t.Errorf("GateDecisions[%s] = %v, want 0", reason, got)
+			}
+		}
+	})
+
+	t.Run("wait decision - counts once per message", func(t *testing.T) {
+		poolID := "pool-test-wait"
+		metrics.InitGateDecisions("", "", poolID)
+		requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+		retryChannel := make(chan pipeline.RetryMessage, 1)
+		resultChannel := make(chan asyncapi.ResultMessage, 1)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		gate := &mockDecisionPoolGate{verdict: pipeline.Wait()}
+		go WorkerWithGate(ctx, ctx, pipeline.Characteristics{}, inferenceClient, requestChannel, retryChannel, resultChannel, defaultRequestTimeout, nil, gate)
+
+		msg := newEmb(asyncapi.RequestMessage{
+			ID:       "req-wait",
+			Created:  time.Now().Unix(),
+			Deadline: time.Now().Add(30 * time.Second).Unix(),
+			Payload:  map[string]any{"model": "test"},
+		}, "http://localhost:30800/v1/completions", nil)
+		msg.WorkerPoolID = poolID
+		requestChannel <- msg
+
+		time.Sleep(250 * time.Millisecond)
+
+		if got := gateDecisionCountForPool(poolID, metrics.ReasonGateClosed); got != 1 {
+			t.Errorf("GateDecisions[gate_closed] = %v, want 1 after multiple wait intervals", got)
+		}
+		for _, reason := range []string{metrics.ReasonQuotaExhausted, metrics.ReasonDropped, metrics.ReasonError} {
+			if got := gateDecisionCountForPool(poolID, reason); got != 0 {
+				t.Errorf("GateDecisions[%s] = %v, want 0", reason, got)
+			}
+		}
+	})
+}
