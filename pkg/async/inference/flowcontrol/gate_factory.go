@@ -113,8 +113,8 @@ func (f *GateFactory) Close() error {
 //     Requires no metric source; the worker reports per-response outcomes to the gate.
 //     Params: min_window (default 1), max_window (default 256), increase (default 1.0),
 //     decrease_factor (default 0.5), hold_duration (default "1s"), tier_label
-//     (default "tier"), queue_duration_target (default "0", disabled), pool (optional,
-//     labels the band-state gauges)
+//     (default "tier"), queue_duration_target (default "0", disabled). The band-state
+//     gauges carry the owning pool's name from GateConfig.Owner, not from params.
 //   - "prometheus-query": Evaluates an arbitrary user-supplied PromQL expression as the dispatch
 //     budget. The expression must resolve to an instant vector with a single sample whose value
 //     is in [0, 1]. Unlike prometheus-saturation and prometheus-budget, this gate does not
@@ -237,7 +237,7 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 			HoldDuration:        holdDuration,
 			TierLabel:           paramString(params, "tier_label", "tier"),
 			QueueDurationTarget: queueDurationTarget,
-			PoolLabel:           paramString(params, "pool", ""),
+			PoolLabel:           cfg.Owner.WorkerPoolID,
 		}), nil
 
 	case "redis":

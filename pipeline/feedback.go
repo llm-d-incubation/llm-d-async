@@ -36,6 +36,8 @@ const (
 // means "no signal".
 type DispatchFeedback struct {
 	// Msg is the dispatched request; gates use it to key per-band state.
+	// Required: feedback with a nil Msg has no band attribution and gates
+	// drop it.
 	Msg *api.InternalRequest
 	// Outcome classifies the response.
 	Outcome DispatchOutcome
@@ -73,7 +75,13 @@ type FeedbackGate interface {
 // woken by an event (a freed slot, a window increase) instead of only a timer.
 type WaitNotifier interface {
 	// WaitSignal returns a channel that receives when the gate may admit a
-	// previously parked request. One receive wakes one waiter; wakes may be
-	// spurious and waiters keep a fallback poll timer.
+	// previously parked request. One receive wakes one waiter; wakes are
+	// hints shared across the gate (a wake may belong to a different band's
+	// slot), may be spurious, and waiters keep a fallback poll timer.
+	//
+	// WaitSignal may return nil when the gate has no wake support (e.g. a
+	// wrapper whose inner gates do not notify). A receive from a nil channel
+	// blocks forever, so callers must treat nil as poll-only rather than
+	// selecting on it exclusively.
 	WaitSignal() <-chan struct{}
 }

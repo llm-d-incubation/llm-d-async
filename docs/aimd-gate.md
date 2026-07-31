@@ -2,7 +2,7 @@
 
 The `aimd` gate sizes dispatch windows from the gateway's responses instead of scraped metrics. This page specifies the gate's behavior; the design rationale, rejected alternatives, and open work live in the feedback-based dispatch control proposal ([proposals/feedback-based-dispatch-control.md](proposals/feedback-based-dispatch-control.md), lands with llm-d-async#379). Every dispatched request already returns an acceptance, a rejection with a reason, or an error, and the gate treats that stream as its capacity signal. It needs no metric source or copied capacity constants, and the window updates on each response with no cache or scrape interval in between.
 
-It is intended as a pool gate (`gate_type` on a worker pool). A window bounds in-flight requests per priority band. When a band's window is full or closed, a reserved request parks its worker in memory and is woken as soon as a slot frees or the window grows; an overflow request is refused back to the broker. Only reserved requests park because a parked worker is unavailable to every band: a closed low-priority band with a deep backlog would otherwise park the whole pool while higher bands have room. A refused request stays in the broker and is redelivered; those redeliveries also serve as the band's probe traffic.
+It is intended as a pool gate (`gate_type` on a worker pool). A window bounds in-flight requests per priority band. When a band's window is full or closed, a reserved request parks its worker in memory; an overflow request is refused back to the broker. A freed slot or a window increase wakes one parked worker. The wake is a hint shared across bands rather than per-band delivery, so parked workers also keep a poll timer as a fallback. Only reserved requests park because a parked worker is unavailable to every band: a closed low-priority band with a deep backlog would otherwise park the whole pool while higher bands have room. A refused request stays in the broker and is redelivered; those redeliveries also serve as the band's probe traffic.
 
 Status: the worker-side wiring that reports response outcomes to the gate lands in a follow-up PR. Until then a configured `aimd` gate admits against its windows but observes no outcomes, so every band stays at `min_window`.
 
@@ -67,15 +67,14 @@ The window self-clocks: an accept frees a slot and grows the window in the same 
     "decrease_factor": 0.5,
     "hold_duration": "1s",
     "tier_label": "tier",
-    "queue_duration_target": "0s",
-    "pool": "inference_pool_1"
+    "queue_duration_target": "0s"
   }
 }
 ```
 
-All parameters are optional; the values above are the defaults except `pool`, which defaults to empty. `queue_duration_target` of zero disables the queue-duration signal. Parameter semantics are listed in the [README's gate parameters section](../README.md#per-queue-dispatch-gates).
+All parameters are optional; the values above are the defaults. `queue_duration_target` of zero disables the queue-duration signal. Parameter semantics are listed in the [README's gate parameters section](../README.md#per-queue-dispatch-gates).
 
-The gate exports its controller state as gauges labeled `(pool_name, band)`: `llm_d_async_async_aimd_window`, `..._aimd_ssthresh`, and `..._aimd_inflight`. Window against ssthresh shows which growth mode a band is in; inflight against window shows band utilization; the `pool` parameter supplies the `pool_name` label.
+The gate exports its controller state as gauges labeled `(pool_name, band)`: `llm_d_async_async_aimd_window`, `..._aimd_ssthresh`, and `..._aimd_inflight`. Window against ssthresh shows which growth mode a band is in; inflight against window shows band utilization; the owning worker pool's ID supplies the `pool_name` label, matching the pool's other series.
 
 Worker count interacts with the windows: a band can never have more requests in flight than there are workers to carry them, so `max_window` beyond the pool's worker count is not reachable. Size workers for the concurrency you want at full health and let the windows do the throttling below that.
 

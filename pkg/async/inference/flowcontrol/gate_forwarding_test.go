@@ -59,6 +59,7 @@ func TestCompositeGate_WaitSignalFanIn(t *testing.T) {
 	first := newForwardingAIMDGate()
 	second := newForwardingAIMDGate()
 	composite := NewCompositeGate(first, second)
+	t.Cleanup(func() { _ = composite.Close() })
 	msg := api.NewInternalRequest(api.InternalRouting{}, &api.RequestMessage{})
 
 	signal := composite.WaitSignal()
@@ -102,6 +103,18 @@ func TestWaitOnRefuseGate_ForwardsFeedbackAndWait(t *testing.T) {
 	plain := NewWaitOnRefuseGate(&mockGate{budget: 1.0})
 	assert.Nil(t, plain.WaitSignal())
 	plain.ObserveOutcome(pipeline.DispatchFeedback{Outcome: pipeline.OutcomeAccepted})
+}
+
+func TestAIMDGate_NilMsgFeedbackIsDropped(t *testing.T) {
+	gate := newForwardingAIMDGate()
+
+	// Feedback without a Msg has no band attribution: it must not create or
+	// mutate any band (defaulting it to the lowest band would hold every
+	// band above on a signal that belongs to none of them).
+	gate.ObserveOutcome(pipeline.DispatchFeedback{Outcome: pipeline.OutcomeRejectedCapacity})
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	assert.Empty(t, gate.bands)
 }
 
 func TestTierPriorityAdmissionGate_WaitingSaturationGateIsSaturated(t *testing.T) {

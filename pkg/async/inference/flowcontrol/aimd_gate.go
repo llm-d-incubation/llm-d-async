@@ -99,8 +99,9 @@ type AIMDConfig struct {
 	// window instead of growing it, and one past twice the target gently
 	// shrinks it. Zero disables the signal.
 	QueueDurationTarget time.Duration
-	// PoolLabel labels this gate's band-state gauges; set it to the worker
-	// pool or inference pool the gate fronts.
+	// PoolLabel labels this gate's band-state gauges. The factory stamps it
+	// from GateConfig.Owner.WorkerPoolID so the series carry the same
+	// pool_name as the owning pool's other metrics; it is not user config.
 	PoolLabel string
 }
 
@@ -209,8 +210,14 @@ func (g *AIMDGate) Apply(ctx context.Context, msg *api.InternalRequest, releases
 	return pipeline.Continue(), nil
 }
 
-// ObserveOutcome implements pipeline.FeedbackGate.
+// ObserveOutcome implements pipeline.FeedbackGate. Feedback without a Msg is
+// dropped: it carries no band attribution, and defaulting it to the lowest
+// band would decrease that band and hold every band above on a signal that
+// belongs to none of them.
 func (g *AIMDGate) ObserveOutcome(fb pipeline.DispatchFeedback) {
+	if fb.Msg == nil {
+		return
+	}
 	g.mu.Lock()
 	b := g.band(fb.Msg)
 	now := g.now()
@@ -370,8 +377,10 @@ func (g *AIMDGate) WaitSignal() <-chan struct{} {
 	return g.notify
 }
 
-// wake wakes one parked worker; parked workers re-apply and park again on a
-// spurious wake.
+// wake offers one wake token, shared across all bands: a freed slot in one
+// band can wake a worker parked on another, which re-applies and parks again.
+// Wakes are hints that shorten the poll interval, not per-band delivery;
+// workers rely on their fallback poll timer for the rest.
 func (g *AIMDGate) wake() {
 	select {
 	case g.notify <- struct{}{}:

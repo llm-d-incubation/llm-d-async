@@ -425,8 +425,8 @@ func TestGateFactory_AIMD(t *testing.T) {
 			"hold_duration":         "500ms",
 			"tier_label":            "my_tier",
 			"queue_duration_target": "200ms",
-			"pool":                  "pool-a",
 		},
+		Owner: pipeline.GateOwner{WorkerPoolID: "pool-a"},
 	})
 	require.NoError(t, err)
 	aimd, ok := gate.(*AIMDGate)

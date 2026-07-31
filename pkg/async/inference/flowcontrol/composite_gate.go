@@ -18,6 +18,7 @@ package flowcontrol
 
 import (
 	"context"
+	"sync"
 
 	"github.com/llm-d/llm-d-async/api"
 	pipeline "github.com/llm-d/llm-d-async/pipeline"
@@ -34,17 +35,21 @@ var _ pipeline.WaitNotifier = (*CompositeGate)(nil)
 // inner gate that consumes them, and inner wait signals are fanned in, so
 // wrapping a feedback gate in a composite does not sever its signal.
 type CompositeGate struct {
-	gates []pipeline.Gate
-	wait  <-chan struct{}
+	gates    []pipeline.Gate
+	wait     <-chan struct{}
+	stop     chan struct{}
+	stopOnce sync.Once
 }
 
 // NewCompositeGate creates a CompositeGate with the given inner gates.
 func NewCompositeGate(gates ...pipeline.Gate) *CompositeGate {
-	c := &CompositeGate{gates: gates}
+	c := &CompositeGate{gates: gates, stop: make(chan struct{})}
 	var signals []<-chan struct{}
 	for _, gate := range gates {
 		if notifier, ok := gate.(pipeline.WaitNotifier); ok {
-			signals = append(signals, notifier.WaitSignal())
+			if signal := notifier.WaitSignal(); signal != nil {
+				signals = append(signals, signal)
+			}
 		}
 	}
 	switch len(signals) {
@@ -54,14 +59,20 @@ func NewCompositeGate(gates ...pipeline.Gate) *CompositeGate {
 		c.wait = signals[0]
 	default:
 		// Fan the inner signals into one channel. The forwarding goroutines
-		// live as long as the process, like the gate itself.
+		// run until Close; production composites are built once at startup
+		// and never closed.
 		merged := make(chan struct{}, 1)
 		for _, signal := range signals {
 			go func(signal <-chan struct{}) {
-				for range signal {
+				for {
 					select {
-					case merged <- struct{}{}:
-					default:
+					case <-c.stop:
+						return
+					case <-signal:
+						select {
+						case merged <- struct{}{}:
+						default:
+						}
 					}
 				}
 			}(signal)
@@ -69,6 +80,12 @@ func NewCompositeGate(gates ...pipeline.Gate) *CompositeGate {
 		c.wait = merged
 	}
 	return c
+}
+
+// Close stops the wait-signal fan-in goroutines. Safe to call more than once.
+func (c *CompositeGate) Close() error {
+	c.stopOnce.Do(func() { close(c.stop) })
+	return nil
 }
 
 // ObserveOutcome implements pipeline.FeedbackGate by forwarding the outcome
