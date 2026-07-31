@@ -5,6 +5,18 @@ ap:
   # For multi-queue/multi-topic setups, set per-entry igw_base_url in
   # redis.queuesConfig / gcpPubSub.topicsConfig instead of this global value.
   igwBaseURL: ""
+  # affinity defines optional pod affinity/anti-affinity/nodeAffinity rules
+  # for the Async Processor deployment, e.g. to pin the dispatcher onto
+  # non-GPU infra nodes:
+  #   affinity:
+  #     nodeAffinity:
+  #       requiredDuringSchedulingIgnoredDuringExecution:
+  #         nodeSelectorTerms:
+  #           - matchExpressions:
+  #               - key: node-role.kubernetes.io/infra
+  #                 operator: In
+  #                 values: ["true"]
+  affinity: {}
   securityContext:
     allowPrivilegeEscalation: false
     readOnlyRootFilesystem: true

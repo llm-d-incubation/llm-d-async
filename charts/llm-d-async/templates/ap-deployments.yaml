@@ -241,3 +241,7 @@ spec:
             secretName: {{ .Values.ap.tls.secretName }}
         {{- end }}
       {{- end }}
+      {{- with .Values.ap.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
