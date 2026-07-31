@@ -147,7 +147,7 @@ The JSON document is transport-specific. Its `queues`/`topics` entries use the s
 }
 ```
 
-The `url` field honors the `REDIS_URL` environment variable as an override for the Redis transports. Per-queue/topic dispatch gates are configured with the `gate_type`/`gate_params` fields (see [Dispatch Gates](#dispatch-gates)).
+For the Redis transports, `REDIS_URL` is used as a fallback default for the `url` field: an explicit `url` in the transport config takes precedence, and `REDIS_URL` fills it in only when `url` is empty. Per-queue/topic dispatch gates are configured with the `gate_type`/`gate_params` fields (see [Dispatch Gates](#dispatch-gates)).
 
 > **Deprecated:** The per-backend flags — `--message-queue-impl`, `--redis.url`, `--redis.*`, `--redis.ss.*`, `--pubsub.*`, `--redis-tracing`, and `--request-merge-policy-config` — still work for backwards compatibility but are deprecated. When used, the processor logs a warning and translates them into the transport config above. `--transport`/`--transport-config` take precedence when both are set. Prefer the new flags.
 

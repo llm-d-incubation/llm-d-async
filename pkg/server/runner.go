@@ -87,7 +87,7 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 	setupLog.Info("Async Processor starting", "version", version.Version, "commit", version.Commit, "buildDate", version.BuildDate)
 
 	printAllFlags(setupLog)
-	opts.WarnDeprecatedFlags(setupLog)
+	opts.warnDeprecatedFlags(setupLog)
 
 	poolsMap, totalConcurrency, err := loadWorkerPools(opts.Worker, setupLog)
 	if err != nil {
@@ -301,6 +301,11 @@ func loadFlow(opts *Options, gateFactory *flowcontrol.GateFactory, poolsMap map[
 		cfg, err := pubsub.LoadConfig(configBytes)
 		if err != nil {
 			return nil, err
+		}
+		// The legacy plain gcp-pubsub alias never gated (see legacyUngatedPubSub);
+		// pass a nil factory so a gate_type in a legacy topics file stays inert.
+		if opts.legacyUngatedPubSub() {
+			return pubsub.NewGCPPubSubMQFlow(*cfg, workerPools, nil)
 		}
 		return pubsub.NewGCPPubSubMQFlow(*cfg, workerPools, gateFactory)
 	default:

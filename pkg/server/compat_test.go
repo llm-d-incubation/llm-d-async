@@ -162,6 +162,52 @@ func TestResolveTransport_NormalizesGatedAlias(t *testing.T) {
 	}
 }
 
+// TestLegacyUngatedPubSub guards the regression where the retired plain
+// gcp-pubsub alias started honoring gate_type: on main it wired no gate factory,
+// so only that ungated alias must withhold the factory. The gated alias and the
+// new --transport surface gate normally.
+func TestLegacyUngatedPubSub(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{
+			name: "legacy plain gcp-pubsub is ungated",
+			args: []string{"--message-queue-impl=gcp-pubsub"},
+			want: true,
+		},
+		{
+			name: "legacy gated alias gates",
+			args: []string{"--message-queue-impl=gcp-pubsub-gated"},
+			want: false,
+		},
+		{
+			name: "new transport surface gates",
+			args: []string{
+				"--transport=gcp-pubsub",
+				`--transport-config={"project_id":"p","result_topic_id":"r","topics":[{"subscriber_id":"s","igw_base_url":"http://gw"}]}`,
+				// A legacy impl set alongside the new flags must not flip the switch.
+				"--message-queue-impl=gcp-pubsub",
+			},
+			want: false,
+		},
+		{
+			name: "legacy redis impl is irrelevant",
+			args: []string{"--message-queue-impl=redis-pubsub"},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			o := newTestOptions(t, tt.args...)
+			if got := o.legacyUngatedPubSub(); got != tt.want {
+				t.Errorf("legacyUngatedPubSub() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestWarnDeprecatedFlags_LegacyUsed(t *testing.T) {
 	o := newTestOptions(t,
 		"--message-queue-impl=redis-sortedset",
@@ -170,7 +216,7 @@ func TestWarnDeprecatedFlags_LegacyUsed(t *testing.T) {
 
 	var msgs []string
 	logger := funcr.New(func(prefix, args string) { msgs = append(msgs, args) }, funcr.Options{})
-	o.WarnDeprecatedFlags(logger)
+	o.warnDeprecatedFlags(logger)
 
 	joined := strings.Join(msgs, "\n")
 	if !strings.Contains(joined, "--message-queue-impl") || !strings.Contains(joined, "--redis.url") {
@@ -190,7 +236,7 @@ func TestWarnDeprecatedFlags_IgnoredWhenNewTransport(t *testing.T) {
 
 	var msgs []string
 	logger := funcr.New(func(prefix, args string) { msgs = append(msgs, args) }, funcr.Options{})
-	o.WarnDeprecatedFlags(logger)
+	o.warnDeprecatedFlags(logger)
 
 	joined := strings.Join(msgs, "\n")
 	if !strings.Contains(joined, "ignored because") || !strings.Contains(joined, "--redis.url") {
@@ -232,7 +278,7 @@ func TestWarnDeprecatedFlags_MergePolicyRenameNotIgnored(t *testing.T) {
 
 	var msgs []string
 	logger := funcr.New(func(prefix, args string) { msgs = append(msgs, args) }, funcr.Options{})
-	o.WarnDeprecatedFlags(logger)
+	o.warnDeprecatedFlags(logger)
 
 	joined := strings.Join(msgs, "\n")
 	if !strings.Contains(joined, "--request-merge-policy-config") ||
@@ -249,7 +295,7 @@ func TestWarnDeprecatedFlags_NoneSet(t *testing.T) {
 
 	var msgs []string
 	logger := funcr.New(func(prefix, args string) { msgs = append(msgs, args) }, funcr.Options{})
-	o.WarnDeprecatedFlags(logger)
+	o.warnDeprecatedFlags(logger)
 
 	if len(msgs) != 0 {
 		t.Errorf("expected no deprecation warnings when no deprecated flags set, got:\n%s", strings.Join(msgs, "\n"))

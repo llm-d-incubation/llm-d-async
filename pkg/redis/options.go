@@ -32,9 +32,12 @@ func LoadPubSubConfig(data []byte) (*PubSubConfig, error) {
 	return &cfg, nil
 }
 
+// ApplyEnvOverrides seeds URL from REDIS_URL only when it is not already set in
+// the config. An explicit url in --transport-config therefore wins over the
+// environment; REDIS_URL is a fallback default, not an override.
 func (c *PubSubConfig) ApplyEnvOverrides() {
-	if envURL := os.Getenv("REDIS_URL"); envURL != "" {
-		c.URL = envURL
+	if c.URL == "" {
+		c.URL = os.Getenv("REDIS_URL")
 	}
 }
 
@@ -98,9 +101,12 @@ func LoadSortedSetConfig(data []byte) (*SortedSetConfig, error) {
 	return &cfg, nil
 }
 
+// ApplyEnvOverrides seeds URL from REDIS_URL only when it is not already set in
+// the config. An explicit url in --transport-config therefore wins over the
+// environment; REDIS_URL is a fallback default, not an override.
 func (c *SortedSetConfig) ApplyEnvOverrides() {
-	if envURL := os.Getenv("REDIS_URL"); envURL != "" {
-		c.URL = envURL
+	if c.URL == "" {
+		c.URL = os.Getenv("REDIS_URL")
 	}
 }
 

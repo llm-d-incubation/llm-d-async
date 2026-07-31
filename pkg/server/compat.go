@@ -57,10 +57,10 @@ func deprecatedFlags() map[string]string {
 	}
 }
 
-// WarnDeprecatedFlags logs a deprecation warning for every deprecated flag the
+// warnDeprecatedFlags logs a deprecation warning for every deprecated flag the
 // user explicitly set. When the new transport flags are in use, the legacy flags
 // are ignored and the warning says so.
-func (o *Options) WarnDeprecatedFlags(logger logr.Logger) {
+func (o *Options) warnDeprecatedFlags(logger logr.Logger) {
 	if o.flagSet == nil {
 		return
 	}
@@ -116,6 +116,16 @@ func (o *Options) resolveTransport() (string, []byte, error) {
 		return "", nil, err
 	}
 	return transportType, data, nil
+}
+
+// legacyUngatedPubSub reports whether the flow was selected via the deprecated
+// --message-queue-impl=gcp-pubsub alias (the plain, ungated one). On the legacy
+// path that alias wired no gate factory, so a gate_type in a topics-config file
+// was inert and every topic got an always-open gate. We preserve that by
+// withholding the factory for it: the retired gcp-pubsub-gated alias and the new
+// --transport surface both gate normally.
+func (o *Options) legacyUngatedPubSub() bool {
+	return !o.usingNewTransport() && o.MessageQueueImpl == "gcp-pubsub"
 }
 
 // normalizeLegacyImpl maps the retired gcp-pubsub-gated alias onto gcp-pubsub;
