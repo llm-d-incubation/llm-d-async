@@ -44,13 +44,15 @@ The processor gains one mechanism in each direction of the boundary:
    | Response | Outcome | Window effect |
    |---|---|---|
    | 2xx | accepted | grows (slow start or additive increase) |
-   | reason `rejected-saturated`, or bare 429 | capacity rejection | multiplicative decrease; `Retry-After` closes the window for its duration |
+   | reason `rejected-saturated`, or bare 429 | capacity rejection | multiplicative decrease; `Retry-After` closes the window for its duration, capped by configuration |
    | reason `rejected-ttl-expired` | queue-TTL expiry | gentle decrease (×0.9) |
    | reason `evicted*` | eviction | none |
    | any other reason | non-capacity rejection | none |
    | transport or bare 5xx error | error | none |
 
-   Below a threshold (`ssthresh`), a band's window grows by `increase` per accept, roughly doubling per window's worth of accepts (slow start); at or above it, by `increase/w` per accept (additive increase). A capacity rejection multiplies the window by `decrease_factor` (default 0.5) and sets `ssthresh` there. Two advisory headers refine the controller when present: advertised band headroom caps the window at in-flight plus headroom, and with a target configured, an accepted response that queued past the target holds the window instead of growing it, since queue time rises before rejections start.
+   Below a threshold (`ssthresh`), a band's window grows by `increase` per accept, roughly doubling per window's worth of accepts (slow start); at or above it, by `increase/window` per accept (additive increase). A capacity rejection multiplies the window by `decrease_factor` (default 0.5) and sets `ssthresh` there. Both factors are conventions: 0.5 is TCP's halving, and the 0.9 applied on queue-TTL expiry backs the band off without costing a full multiplicative step. A `Retry-After` on the rejection closes the band for its duration, capped by configuration: the header is advisory ([RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#field.retry-after)), the projection behind it rides on a drain-rate estimate, and a closed band produces no responses that could correct a wrong one.
+
+   Two advisory headers refine the controller when present: advertised band headroom caps the window at in-flight plus headroom, and with a target configured, an accepted response that queued past the target holds the window instead of growing it, since queue time rises before rejections start. The queue-duration signal also sets the controller's operating point. A rejection-driven controller settles wherever the detector begins rejecting: near the concurrency limit under a detector that rejects early, on top of a standing queue under one that admits into deep queueing before rejecting. With a delay target the gate regulates ahead of the rejection threshold instead of inheriting it, so the benchmark plan covers detector configurations of both kinds.
 
    The window bounds in-flight requests per band. When a band's window is full or closed, only reserved requests park a dispatch worker until a slot frees; overflow requests are refused back to the broker and retry from there. A parked worker is unavailable to every band, so parking is limited to the traffic that cannot be shed.
 
@@ -62,11 +64,50 @@ The contract, with the status of each field:
 |---|---|---|
 | `x-llm-d-request-dropped-reason` | router → processor | shipped in the router; consumed |
 | Bare 429 as capacity rejection | router → processor | fallback for gateways without reasons |
-| `Retry-After` on capacity rejections | router → processor | consumed if present; router does not emit yet |
+| `Retry-After` on capacity rejections | router → processor | consumed if present, as a bounded hint; router does not emit yet |
 | `x-llm-d-inference-fairness-id` | processor → router | read by the router; stamped by the reference implementation |
 | `x-llm-d-flow-queue-duration-ms` | router → processor | provisional name; consumed if present |
 | `x-llm-d-flow-band-headroom` | router → processor | provisional name; consumed if present |
 | Deadline header → TTL hint | processor → router | not yet defined on either side |
+
+The diagram below answers which of these fields carry signal on a round-trip today: it traces one dispatch through the accept and capacity-rejection paths, with each header labeled by its status from the table. Two label families recur in every figure in this document: `[live]` marks behavior that fires against today's router, and `[awaits router: <signal>]` marks code that is dormant until the router emits the named signal.
+
+```mermaid
+sequenceDiagram
+    participant B as Broker
+    participant M as Merge policy
+    participant W as Worker
+    participant G as aimd gate
+    participant R as Router
+
+    B->>M: next request from a tenant queue
+    M->>W: merged stream, headers stamped
+    Note over M,W: x-gateway-inference-objective [live]<br/>x-llm-d-inference-fairness-id [live, router reads it]<br/>x-gateway-priority [stamped, router does not read]
+    W->>G: Apply (request's band)
+    alt window open
+        G-->>W: Continue, slot taken
+        W->>R: dispatch, send time recorded
+        Note over R: band queue, strict-priority dispatch
+        alt accepted
+            R-->>W: 2xx<br/>x-llm-d-flow-queue-duration-ms [provisional name, awaits router]<br/>x-llm-d-flow-band-headroom [provisional name, awaits router]
+            W->>G: ObserveOutcome(accepted, send time)
+            Note over G: window grows if sent after last decrease [live]<br/>holds on higher bands cleared [live]
+            G-->>W: wake signal to parked workers [live]
+        else capacity rejection
+            R-->>W: 429<br/>x-llm-d-request-dropped-reason rejected-saturated [live]<br/>Retry-After [awaits router emission]
+            W->>G: ObserveOutcome(capacity rejection, send time)
+            Note over G: window *= decrease_factor, once per flight [live]<br/>lower bands decrease, higher bands hold [live]<br/>Retry-After closes the window, capped [awaits router]
+            W->>B: re-enqueue with backoff [live]
+            B->>M: redeliver after backoff
+        end
+    else band full or closed, reserved request
+        G-->>W: Wait
+        Note over W,G: worker parks, wakes on signal or poll, re-applies [live]
+    else band full or closed, overflow request
+        G-->>W: Refuse
+        W->>B: yield back to broker, retry later [live]
+    end
+```
 
 The reference implementation (the gate in llm-d-async#382; worker wiring and the benchmark following) comprises:
 
@@ -105,6 +146,31 @@ Q(t) = ∫(λ − μ) dt. The three pending signals are readings of this picture
 
 One estimator, {Q per band, μ̂}, produces all three fields. Q per band already exists in the router's [registry statistics](https://github.com/llm-d/llm-d-router/blob/eb1e027a7db8bff1086c20bc3080119a3d88f274/pkg/epp/flowcontrol/contracts/registry.go#L161-L173); μ̂ (a drain-rate estimate, e.g. an exponentially weighted average of dispatch completions per second) is the single flow signal the router does not compute today.
 
+The block diagram below places each contract signal on the loop around this integrator. The processor closes an outer loop around the router's inner regulation, which is shipped behavior; solid feedback arrows carry signal today, and dashed arrows tagged `[awaits router: …]` are dormant until the router emits them. The controller has no error term in the classical sense: it probes until a constraint signal fires. A configured queue-duration target is the exception, giving the loop a setpoint.
+
+```mermaid
+flowchart LR
+    T["queue-duration target (config)"] -. "setpoint [awaits router: queue-duration]" .-> C
+    subgraph PROC ["Processor (outer loop, this proposal)"]
+        C["AIMD controller<br/>one window per band"]
+        A["dispatch workers<br/>in-flight bounded by window"]
+        S["outcome classifier<br/>stamps send time"]
+    end
+    subgraph RTR ["Router (inner regulation, shipped)"]
+        R["band queues integrate demand minus service,<br/>strict-priority dispatch"]
+    end
+    P["pool (model servers)<br/>drains the queues at the service rate"]
+    D["other tenants and bands"] -. "disturbance" .-> R
+    C -- "window" --> A
+    A -- "dispatched requests" --> R
+    R -- "dispatch" --> P
+    P -- "completions" --> R
+    R -- "2xx and drop reasons [live]" --> S
+    R -. "Retry-After [awaits router: Retry-After]" .-> S
+    R -. "queue duration, headroom [awaits router: advisory views]" .-> S
+    S -- "per-band outcomes" --> C
+```
+
 ### The priority ladder
 
 Suppose 64 workers dispatch against a pool whose gateway admits 32 concurrent requests. Batch traffic starts drawing `rejected-saturated` while interactive traffic is still accepted. The batch window should shrink. The open questions are what the interactive band should learn from batch's rejections, and what batch should learn from interactive's accepts.
@@ -119,9 +185,48 @@ Each band's outcomes observe that level from one side only: an accept at band b 
 
 Sheddable traffic (traffic admitted on the condition that it can be rejected) runs at the pool's edge, where a rejection is cheap: the request survives in the broker and retries. Its rejections supply most of the evidence the gate uses to grow the higher bands.
 
+The coupling rules assume the router dispatches these bands in the order the processor ranks them. The router assigns a request's band from the inference objective it resolves to, not from a stamped priority, so the assumption holds where each tier maps to an objective whose priority agrees with the processor's lane order; aligning that mapping is part of the taxonomy ratification under joint work. Where the router distinguishes fewer bands than the processor models, rejections arrive without regard to processor rank and the coupling degrades toward one shared window across the merged bands: more throttling than per-band control, in the conservative direction.
+
 ### Evidence ordering
 
 Outcomes arrive out of order with respect to sends. A rejection returns in one round trip; an accept returns after queueing plus generation, so an accept observed after a rejection may describe conditions from before it. The rule, borrowed from TCP's recovery point: optimistic updates (growth, hold-clearing) require the accepted request to have been sent after the evidence they override. The guard is conservative in the correct direction, because an accept proves margin at dispatch time, which is bounded below by send time.
+
+The diagram below shows the modes of one band's controller. The two regions inside Open vary independently: one tracks how fast accepts grow the window, the other whether growth is allowed at all. Transitions mark mode changes only — the per-outcome window arithmetic is in the outcome table under Proposal, and evictions, non-capacity rejections, and errors change no mode and no window (`[no-op by design]`). Every mode change fires against today's router except the close and reopen, which wait on Retry-After.
+
+```mermaid
+stateDiagram-v2
+    state Open {
+        state "Slow start" as SS
+        SS : grows fast, window below ssthresh
+        state "Congestion avoidance" as CA
+        CA : probes gently at ssthresh
+        [*] --> SS
+        SS --> CA : accepts reach ssthresh, or first decrease [live]
+        --
+        state "Growth allowed" as Allowed
+        state "Growth held" as Held
+        Held : rejections still decrease
+        [*] --> Allowed
+        Allowed --> Held : congestion at a lower band [live] (fresh evidence)
+        Held --> Allowed : hold expires, or a lower band accepts [live] (accept postdates hold)
+    }
+    Closed : window at min until Retry-After elapses
+    Open --> Closed : rejection carries Retry-After [awaits router: Retry-After]
+    Closed --> Open : reopens in slow start [awaits router: Retry-After]
+
+    note right of Closed
+        A close at a higher band is inherited below.
+        While a band is full or closed, Apply parks
+        reserved requests (Wait) and refuses overflow
+        back to the broker (Refuse) [live]
+    end note
+
+    note left of Open
+        (...) marks a send-time guard, the recovery point:
+        stale accepts do not grow the window or clear holds,
+        stale rejections do not decrease or re-hold it
+    end note
+```
 
 ### Sampling and statistical significance
 
@@ -131,7 +236,7 @@ The additive side is already normalized: `increase/window` per accept yields con
 
 The first problem on the multiplicative side is burst multiplicity: N rejections from one congestion event must count as one decrease. A wall-clock cooldown coalesces in the wrong dimension, since one second spans many flights when generations are short and a fraction of one flight when decodes are long. The dimensionless coalescing unit is the flight: a rejection whose request was sent before the band's previous decrease belongs to the event already acted on. The recovery point that gates optimistic updates already supplies this boundary.
 
-The second is per-event weight: even one decrease per flight discards half of a 200-slot window on a single marginal rejection, which may be a race for the last band slot rather than real congestion. DCTCP's answer fits: decrease proportional to an exponentially weighted fraction of rejected outcomes per flight (`w ← w(1 − α/2)`). It degrades correctly at both extremes: at window 1 a rejection is the entire sample and the decrease approaches halving, while at window 200 one rejection is negligible. It needs per-flight outcome accounting, so it is deferred to work-plan item 4, to be adopted only on benchmark evidence of over-reaction.
+The second is per-event weight: even one decrease per flight discards half of a 200-slot window on a single marginal rejection, which may be a race for the last band slot rather than real congestion. DCTCP's answer fits: decrease proportional to an exponentially weighted fraction of rejected outcomes per flight (`w ← w(1 − α/2)`). It degrades correctly at both extremes: at window 1 a rejection is the entire sample and the decrease approaches halving, while at window 200 one rejection is negligible. It needs per-flight outcome accounting, so it is deferred to work-plan item 6, to be adopted only on benchmark evidence of over-reaction.
 
 The advisory views sit outside this asymmetry: band headroom is written at response time and is fresh regardless of send time; queue duration describes the interval from send to dispatch; outcomes evidence dispatch-time conditions and are the stalest. The recovery-point guard therefore applies only to outcome-derived updates; the headroom cap is exempt.
 
@@ -139,10 +244,12 @@ The advisory views sit outside this asymmetry: band headroom is written at respo
 
 1. Eviction-rate damping: sustained evictions in a band should weaken the upward "there is margin" inference from that band's accepts, since overcommitted accepts overstate capacity.
 2. Tighten the recovery-point guard using queue duration when present (dispatch time = send time + queue duration, a later and sharper bound than send time).
-3. Scrape the processor's metrics endpoint in the e2e Prometheus to capture per-band window trajectories during benchmarks.
-4. DCTCP-style proportional decrease (`w ← w(1 − α/2)`, α an EWMA of the rejected fraction per flight), weighting congestion evidence by sample size at high concurrency. Adopt only if future benchmarks show over-reaction.
+3. Flight-time-scaled hold duration: derive the growth-hold cooldown from a per-band estimate of send-to-outcome latency, the way TCP derives its retransmission timeout from measured round-trip time. A wall-clock constant expires mid-event under long decodes and outlives the event under short ones.
+4. Per-band outcome counters (`async_aimd_outcomes_total` by band and outcome), so a window pinned at the floor is attributable: dominant capacity rejections mean saturation; dominant queue-TTL expiries mean deadline budgets the pool cannot meet at any window size.
+5. Scrape the processor's metrics endpoint in the e2e Prometheus to capture per-band window trajectories during benchmarks.
+6. DCTCP-style proportional decrease (`w ← w(1 − α/2)`, α an EWMA of the rejected fraction per flight), weighting congestion evidence by sample size at high concurrency. Adopt only if future benchmarks show over-reaction.
 
-Router-side signal work (Retry-After emission and its drain-rate estimate, the queue-duration and band-headroom piggybacks, the deadline-to-TTL mapping) and joint ratification (the advisory header names, the priority taxonomy that names the tiers and classifications, and a conformance test) are being worked with the `llm-d-router` maintainers and will be proposed there separately.
+Router-side signal work (Retry-After emission and its drain-rate estimate, the queue-duration and band-headroom piggybacks, the deadline-to-TTL mapping) and joint ratification (the advisory header names, the priority taxonomy that names the tiers and classifications, and a conformance test) are being worked with the `llm-d-router` maintainers and will be proposed there separately. Within that work, the queue-duration piggyback carries the same weight as Retry-After emission, for the operating-point reason under Proposal, and the conformance test should assert that the objective-to-priority mapping preserves the processor's lane order.
 
 ## Alternatives
 
@@ -156,6 +263,6 @@ Router-side signal work (Retry-After emission and its drain-rate estimate, the q
 
 **One shared pool window decomposed by priority.** Rejected. It matches the pool's physics but erases the ceiling structure: batch can be legitimately rejected while interactive has real room, and a shared window over-throttles the top on rejections at the bottom.
 
-**Hold-clearing by source tracking.** A first design tracked which band's evidence set each growth hold and required an accept at that rank to clear it. It fails in the normal operating regime: under stable partial saturation (sheddable squeezed out, a middle band flowing, which is the intended steady state once sheddable admission is overcommitted), source tracking leaves the top bands held indefinitely by the rejection stream below, while the flowing band in between is continuing evidence of their margin. The proposed rule (an accept at any lower band clears the holds above it) is simpler and handles this regime.
+**Hold-clearing by source tracking.** Rejected. The natural bookkeeping records which band's evidence set each growth hold and requires an accept at that band to clear it. It fails in the normal operating regime: under stable partial saturation (sheddable squeezed out, a middle band flowing, which is the intended steady state once sheddable admission is overcommitted), source tracking leaves the top bands held indefinitely by the rejection stream below, while the flowing band in between is continuing evidence of their margin. The proposed rule (an accept at any lower band clears the holds above it) is simpler and handles this regime.
 
 **Reacting to evictions.** Rejected. An eviction is admitted work revoked to make room for higher-priority work; the request retries from the broker, and the sender loses only the compute already spent. A single eviction carries no saturation information. A sustained eviction rate should eventually damp the margin inference (work-plan item 1).
