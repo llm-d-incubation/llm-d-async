@@ -1,6 +1,6 @@
 module github.com/llm-d/llm-d-async
 
-go 1.25.8
+go 1.26.0
 
 require (
 	cloud.google.com/go/monitoring v1.30.0
