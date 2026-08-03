@@ -763,15 +763,16 @@ func TestRetryMessage_retryAfterHonored(t *testing.T) {
 		Deadline: time.Now().Add(100 * time.Second).Unix(),
 	}, "", nil)
 
-	// Server says wait 30s; expBackoff for retry 1 would be ~[1,2) seconds,
-	// so the Retry-After value should win.
+	// Server says wait 30s; expBackoff for retry 1 jitters in [2,4), and the
+	// hint fits half the 100s deadline, so it wins — jittered up by <25% to
+	// spread messages rejected by the same event.
 	retryMessage(context.Background(), msg, retryChannel, resultChannel, 30*time.Second, asyncapi.InferenceResponse{})
 	if len(retryChannel) != 1 {
 		t.Fatalf("expected one message in retry channel, got %d", len(retryChannel))
 	}
 	retryMsg := <-retryChannel
-	if retryMsg.BackoffDurationSeconds < 30 {
-		t.Errorf("expected backoff >= 30s (Retry-After), got %f", retryMsg.BackoffDurationSeconds)
+	if retryMsg.BackoffDurationSeconds < 30 || retryMsg.BackoffDurationSeconds >= 37.5 {
+		t.Errorf("expected backoff in [30, 37.5) (jittered Retry-After), got %f", retryMsg.BackoffDurationSeconds)
 	}
 }
 
@@ -796,7 +797,7 @@ func TestRetryMessage_retryAfterIgnoredWhenSmaller(t *testing.T) {
 	}
 }
 
-func TestRetryMessage_retryAfterExceedsDeadlineFallsBackToBackoff(t *testing.T) {
+func TestRetryMessage_retryAfterOversizedClampedNotTerminal(t *testing.T) {
 	retryChannel := make(chan pipeline.RetryMessage, 1)
 	resultChannel := make(chan asyncapi.ResultMessage, 1)
 	msg := newEmb(asyncapi.RequestMessage{
@@ -806,9 +807,10 @@ func TestRetryMessage_retryAfterExceedsDeadlineFallsBackToBackoff(t *testing.T) 
 	}, "", nil)
 
 	// Server says wait 30s, but the deadline is only 5s away. The hint is
-	// ignored rather than terminal: the server's estimate alone must not
+	// clamped rather than terminal: the server's estimate alone must not
 	// burn a message's remaining retry budget (it may be wrong, and the
-	// retry costs nothing durable), so the backoff schedule applies.
+	// retry costs nothing durable). Clamped to half the deadline (2.5s),
+	// jittered to [2.5, 3.125), floored by the backoff sample [2, 4).
 	retryMessage(context.Background(), msg, retryChannel, resultChannel, 30*time.Second, asyncapi.InferenceResponse{})
 	if len(resultChannel) > 0 {
 		t.Fatalf("message terminated early; want a scheduled retry")
@@ -817,8 +819,31 @@ func TestRetryMessage_retryAfterExceedsDeadlineFallsBackToBackoff(t *testing.T) 
 		t.Fatalf("expected one message in retry channel, got %d", len(retryChannel))
 	}
 	retryMsg := <-retryChannel
-	if retryMsg.BackoffDurationSeconds <= 0 || retryMsg.BackoffDurationSeconds >= 5 {
-		t.Errorf("backoff = %f, want backoff-schedule value within the deadline", retryMsg.BackoffDurationSeconds)
+	if retryMsg.BackoffDurationSeconds < 2.5 || retryMsg.BackoffDurationSeconds >= 5 {
+		t.Errorf("backoff = %f, want clamped value in [2.5, 5)", retryMsg.BackoffDurationSeconds)
+	}
+}
+
+func TestRetryMessage_retryAfterClampedToHalfDeadline(t *testing.T) {
+	retryChannel := make(chan pipeline.RetryMessage, 1)
+	resultChannel := make(chan asyncapi.ResultMessage, 1)
+	msg := newEmb(asyncapi.RequestMessage{
+		ID:       "retry-after-clamped",
+		Created:  time.Now().Unix(),
+		Deadline: time.Now().Add(40 * time.Second).Unix(),
+	}, "", nil)
+
+	// Server says wait 300s with 40s to the deadline. The hint is clamped to
+	// half the remaining deadline (20s) and jittered to [20, 25) — the
+	// message waits as long as its budget allows instead of retrying against
+	// a saturated gateway on the backoff floor ([2, 4) at retry 1).
+	retryMessage(context.Background(), msg, retryChannel, resultChannel, 300*time.Second, asyncapi.InferenceResponse{})
+	if len(retryChannel) != 1 {
+		t.Fatalf("expected one message in retry channel, got %d", len(retryChannel))
+	}
+	retryMsg := <-retryChannel
+	if retryMsg.BackoffDurationSeconds < 20 || retryMsg.BackoffDurationSeconds >= 25 {
+		t.Errorf("backoff = %f, want clamped value in [20, 25)", retryMsg.BackoffDurationSeconds)
 	}
 }
 
