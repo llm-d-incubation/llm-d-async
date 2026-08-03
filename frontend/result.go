@@ -15,9 +15,11 @@ import (
 // fetching a result requires knowing both the tenant and the id: a caller
 // presenting the wrong tenant simply finds nothing. Messages enqueued by the
 // frontend set result_queue_name to this key, and the AP's result writer
-// delivers there. Fetch reads are non-destructive (the key expires via its
-// TTL, or earlier via DELETE); wait mode deletes the key once the result is
-// delivered on the held connection, its only consumer.
+// delivers there. Fetch reads are non-destructive: a delivered fetch shrinks
+// the TTL to resultFetchGraceTTL (covering lost-response retries), DELETE
+// reclaims immediately, and the full TTL bounds the unfetched case. Wait mode
+// deletes the key once the result is delivered on the held connection, its
+// only consumer.
 func resultKey(tenant, id string) string {
 	return resultKeyPrefix + tenant + ":" + id
 }

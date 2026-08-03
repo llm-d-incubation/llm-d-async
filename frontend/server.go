@@ -32,6 +32,13 @@ type submitter interface {
 // unavailable (Redis without keyspace notifications, or wakeupMode: poll).
 const waitPollInterval = 200 * time.Millisecond
 
+// resultFetchGraceTTL is the mailbox expiry applied after a successful fetch
+// delivery. The full result TTL exists for the completion-to-first-fetch
+// window, which is client paced. After a delivered fetch, retention only
+// covers lost-response retries, which fire within seconds, so the key is
+// shrunk to this grace window instead of lingering for the full TTL.
+const resultFetchGraceTTL = 60 * time.Second
+
 // waitBackupPollInterval is the slow safety poll under the notify wake-up:
 // keyspace notifications are fire and forget, so a lost notification is
 // recovered on the next backup tick rather than never.
@@ -172,8 +179,17 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	case stateReady:
 		s.metrics.fetchTotal.WithLabelValues("ready").Inc()
 		w.Header().Set(s.cfg.RequestIDHeader, id)
-		// Fetch stays non-destructive: the client confirms receipt via DELETE.
-		_ = writeResult(w, res)
+		// Fetch stays non-destructive, but a confirmed delivery shrinks the
+		// mailbox TTL to the retry grace window. Deleting outright would race
+		// the client's retry of a response lost past the frontend's write.
+		// DELETE remains the immediate reclaim for tidy clients.
+		if writeResult(w, res) == nil {
+			graceCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := s.rdb.Expire(graceCtx, resultKey(s.tenantOf(r), id), resultFetchGraceTTL).Err(); err != nil {
+				s.logger.Warn("failed to shrink result ttl after fetch", "id", id, "error", err)
+			}
+		}
 	case statePending:
 		s.metrics.fetchTotal.WithLabelValues("pending").Inc()
 		writePending(w, id)

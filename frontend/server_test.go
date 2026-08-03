@@ -166,6 +166,12 @@ func TestFetchLifecycle(t *testing.T) {
 		assert.JSONEq(t, `{"done":true}`, rec.Body.String())
 	}
 
+	// A delivered fetch shrinks the mailbox TTL to the retry grace window
+	// instead of leaving it for the full result TTL.
+	ttl := env.mr.TTL(resultKey(defaultTenant, "fetch-1"))
+	assert.Greater(t, ttl, time.Duration(0), "grace TTL should be set")
+	assert.LessOrEqual(t, ttl, resultFetchGraceTTL)
+
 	// Eager cleanup, then gone.
 	req = httptest.NewRequest(http.MethodDelete, "/v1/requests/fetch-1", nil)
 	rec = httptest.NewRecorder()
