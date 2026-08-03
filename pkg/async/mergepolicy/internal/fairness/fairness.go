@@ -5,7 +5,10 @@
 package fairness
 
 import (
+	"fmt"
 	"strings"
+
+	"golang.org/x/net/http/httpguts"
 
 	"github.com/llm-d/llm-d-async/api"
 )
@@ -14,6 +17,13 @@ import (
 // not configure one. It matches the redis-quota gate's default so both sides key
 // on the same tenant.
 const DefaultAttribute = "userid"
+
+// maxIdentityLen bounds the stamped identity. Envoy's default header limit is
+// around 60 KiB, so an oversized attribute would turn every one of a tenant's
+// requests into a 431 at the gateway, and it amplifies gateway access logs. A
+// tenant ID is far shorter than this in practice; anything longer is skipped
+// rather than stamped.
+const maxIdentityLen = 256
 
 // Params are the fairness parameters every merge policy accepts in its plugin
 // configuration. Embed it in a policy's parameter struct; encoding/json promotes
@@ -25,14 +35,22 @@ type Params struct {
 	Attribute string  `json:"fairness_attribute"`
 }
 
-// HeaderOrDefault returns the configured header name, falling back to
+// ResolveHeader returns the configured header name, falling back to
 // api.FairnessIDHeader when the parameter was absent. An explicit "" is returned
 // unchanged, since that disables stamping.
-func (p Params) HeaderOrDefault() string {
+//
+// It errors when the configured name is not a legal HTTP header name. net/http
+// refuses to write such a header, which would fail every dispatched request
+// permanently as a non-retryable error, so an operator's typo has to surface at
+// startup rather than at dispatch.
+func (p Params) ResolveHeader() (string, error) {
 	if p.Header == nil {
-		return api.FairnessIDHeader
+		return api.FairnessIDHeader, nil
 	}
-	return *p.Header
+	if *p.Header != "" && !httpguts.ValidHeaderFieldName(*p.Header) {
+		return "", fmt.Errorf("fairness_header %q is not a legal HTTP header name", *p.Header)
+	}
+	return *p.Header, nil
 }
 
 // Stamper writes a tenant identity into an HTTP header. The zero Stamper is
@@ -52,40 +70,36 @@ func New(header string, attribute string) Stamper {
 	return Stamper{header: header, attribute: attribute}
 }
 
-// Stamp writes the tenant identity from req's metadata into headers. It is a
-// no-op when stamping is disabled, when req already carries the header, when the
-// attribute is absent or empty, or when the identity is not a legal HTTP header
-// value.
+// Stamp writes the tenant identity from req's metadata into headers, replacing
+// any value already there. Call it after the caller's own headers have been
+// merged in: the identity the quota gate accounts on must be the one the gateway
+// arbitrates on, or a tenant could be charged as one flow while presenting as
+// another.
+//
+// It is a no-op when stamping is disabled, when the attribute is absent or
+// empty, or when the identity is too long or not a legal HTTP header value. In
+// those cases there is no identity to assert, so a caller-supplied header is
+// left as it was rather than dropped for nothing.
 func (s Stamper) Stamp(headers map[string]string, req api.Request) {
 	if s.header == "" {
 		return
 	}
-	// HTTP header names are case-insensitive and net/http canonicalizes them on
-	// write, so a caller-set header under any casing takes precedence: stamping
-	// anyway would leave two map keys collapsing onto one wire header with
-	// nondeterministic precedence.
-	for k := range req.ReqHeaders() {
-		if strings.EqualFold(k, s.header) {
-			return
-		}
-	}
+	// Metadata is caller-supplied and has never reached the wire before now.
+	// net/http fails the entire request on a header value it cannot write, and a
+	// best-effort fairness hint must not cost a request, so an identity that
+	// cannot be stamped is skipped instead.
 	id := req.ReqMetadata()[s.attribute]
-	if id == "" || !validHeaderValue(id) {
+	if id == "" || len(id) > maxIdentityLen || !httpguts.ValidHeaderFieldValue(id) {
 		return
 	}
-	headers[s.header] = id
-}
-
-// validHeaderValue reports whether v can be written as an HTTP header value,
-// mirroring what net/http enforces at write time. Metadata is caller-supplied,
-// and net/http fails the entire request on a value it cannot write; a
-// best-effort fairness hint must not cost the request, so an invalid identity
-// skips the stamp instead.
-func validHeaderValue(v string) bool {
-	for i := range len(v) {
-		if b := v[i]; (b < 0x20 && b != '\t') || b == 0x7f {
-			return false
+	// HTTP header names are case-insensitive and net/http canonicalizes them on
+	// write, so leaving a caller's case variant in place alongside the stamp
+	// would collapse two map keys onto one wire header with nondeterministic
+	// precedence. Drop every variant first.
+	for k := range headers {
+		if strings.EqualFold(k, s.header) {
+			delete(headers, k)
 		}
 	}
-	return true
+	headers[s.header] = id
 }

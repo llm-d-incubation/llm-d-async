@@ -19,8 +19,10 @@ type Request interface {
 }
 
 // FairnessIDHeader is the request header llm-d-router's flow control reads to
-// arbitrate fairness between flows. The processor stamps it with the tenant
-// attribute it keys quota on, so tenant isolation extends past dispatch.
+// arbitrate fairness between flows. The processor stamps it with the same tenant
+// attribute it keys quota on, replacing any caller-supplied value, so a tenant is
+// arbitrated under the identity it is accounted under. Messages carrying no such
+// attribute reach the gateway with whatever the caller sent.
 const FairnessIDHeader = "x-llm-d-inference-fairness-id"
 
 // RequestMessage contains the caller-visible fields of a request. Metadata is

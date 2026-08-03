@@ -400,13 +400,13 @@ The merge policy is configured using the `--request-merge-policy-config` CLI fla
 
 1. **`random-robin`**: Randomly picks messages from all queues configured for a given pool. This is the default policy.
    - **Parameters**:
-     - `fairness_header` (optional, string): The HTTP header name used to pass the tenant's fairness identity to the gateway's flow control. Set to `""` to disable stamping. Default is `"x-llm-d-inference-fairness-id"`.
-     - `fairness_attribute` (optional, string): The message metadata attribute holding the tenant identity (the same attribute the `redis-quota` gate keys on). The header is only stamped when the attribute is present, non-empty, and a legal HTTP header value; a caller-supplied header with the same name (any letter case) takes precedence. Default is `"userid"`.
+     - `fairness_header` (optional, string): The HTTP header name used to pass the tenant's fairness identity to the gateway's flow control. Set to `""` to disable stamping. A name that is not a legal HTTP header name is rejected at startup. Default is `"x-llm-d-inference-fairness-id"`.
+     - `fairness_attribute` (optional, string): The message metadata attribute holding the tenant identity (the same attribute the `redis-quota` gate keys on). The stamped value replaces any caller-supplied header of the same name under any letter case, so the identity the gateway arbitrates on is the one quota is accounted against. The header is only stamped when the attribute is present, non-empty, at most 256 bytes, and a legal HTTP header value; otherwise the request dispatches with the header untouched. Default is `"userid"`.
    - **Note**: Stamping is on by default and sends the attribute's value to the gateway, where it may be recorded in access logs. Prefer an opaque tenant ID over personally identifying values such as email addresses, or set `fairness_header` to `""` to disable stamping.
 2. **`tier-priority`**: Buckets requests into 6 strict priority lanes using routing tags (`(classification, tier)`). Within each bucket, it round-robins across different client channels and stamps the chosen priority header (`x-gateway-priority` by default).
    - **Note**: The `tier-priority` merge policy assumes that all messages within a single queue share the same priority. Message classification relies on the FIFO order of an individual queue, and a message's classification does not change after it is pulled off the queue.
    - **Parameters**:
-     - `priority_header` (optional, string): The HTTP header name used to pass the priority value downstream to the inference scheduler. Default is `"x-gateway-priority"`.
+     - `priority_header` (optional, string): The HTTP header name used to pass the priority value downstream to the inference scheduler. A name that is not a legal HTTP header name is rejected at startup. Default is `"x-gateway-priority"`.
      - `tier_label` (optional, string): The label name on `InternalRequest.Labels` used to look up the request's priority tier. Default is `"tier"`.
      - `fairness_header` / `fairness_attribute` (optional, string): Same as for `random-robin`.
 

@@ -21,8 +21,12 @@ func init() {
 				return nil, fmt.Errorf("failed to parse random-robin parameters: %w", err)
 			}
 		}
+		fairnessHeader, err := params.ResolveHeader()
+		if err != nil {
+			return nil, fmt.Errorf("invalid random-robin parameters: %w", err)
+		}
 		return NewRandomRobinPolicy(name, Config{
-			FairnessHeader:    params.HeaderOrDefault(),
+			FairnessHeader:    fairnessHeader,
 			FairnessAttribute: params.Attribute,
 		}), nil
 	})
@@ -126,12 +130,12 @@ func (r *RandomRobinPolicy) MergeRequestChannels(channels []pipeline.RequestChan
 					if chMeta.InferenceObjective != "" {
 						headers["x-gateway-inference-objective"] = chMeta.InferenceObjective
 					}
-					// Stamped before the caller's headers are merged in so that a
-					// caller-supplied fairness header wins.
-					r.fairness.Stamp(headers, ir.PublicRequest)
 					for k, v := range ir.PublicRequest.ReqHeaders() {
 						headers[k] = v
 					}
+					// Stamped after the caller's headers so the tenant the quota
+					// gate accounts on is the one the gateway arbitrates on.
+					r.fairness.Stamp(headers, ir.PublicRequest)
 					erm := pipeline.EmbelishedRequestMessage{
 						InternalRequest: ir,
 						HttpHeaders:     headers,

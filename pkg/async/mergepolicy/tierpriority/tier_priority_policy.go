@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"sync"
 
+	"golang.org/x/net/http/httpguts"
+
 	"github.com/llm-d/llm-d-async/api"
 	"github.com/llm-d/llm-d-async/pipeline"
 	"github.com/llm-d/llm-d-async/pkg/async/mergepolicy/internal/fairness"
@@ -29,10 +31,19 @@ func init() {
 		if params.PriorityHeader == "" {
 			params.PriorityHeader = "x-gateway-priority"
 		}
+		// An illegal header name is one net/http refuses to write, which would
+		// fail every dispatched request permanently; surface it at startup.
+		if !httpguts.ValidHeaderFieldName(params.PriorityHeader) {
+			return nil, fmt.Errorf("invalid tier-priority parameters: priority_header %q is not a legal HTTP header name", params.PriorityHeader)
+		}
+		fairnessHeader, err := params.ResolveHeader()
+		if err != nil {
+			return nil, fmt.Errorf("invalid tier-priority parameters: %w", err)
+		}
 		return NewTierPriorityPolicy(name, Config{
 			PriorityHeader:    params.PriorityHeader,
 			TierLabel:         params.TierLabel,
-			FairnessHeader:    params.HeaderOrDefault(),
+			FairnessHeader:    fairnessHeader,
 			FairnessAttribute: params.Attribute,
 		}), nil
 	})
@@ -312,12 +323,12 @@ func (p *TierPriorityPolicy) MergeRequestChannels(channels []pipeline.RequestCha
 				if chMeta.InferenceObjective != "" {
 					headers["x-gateway-inference-objective"] = chMeta.InferenceObjective
 				}
-				// Stamped before the caller's headers are merged in so that a
-				// caller-supplied fairness header wins.
-				fairnessStamper.Stamp(headers, ir.PublicRequest)
 				for k, v := range ir.PublicRequest.ReqHeaders() {
 					headers[k] = v
 				}
+				// Stamped after the caller's headers so the tenant the quota
+				// gate accounts on is the one the gateway arbitrates on.
+				fairnessStamper.Stamp(headers, ir.PublicRequest)
 
 				pri := getPriorityIndex(ir, tierLabel)
 				if priorityHeader != "" {
