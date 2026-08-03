@@ -67,6 +67,7 @@ type RedisSortedSetFlow struct {
 	resultChannel           chan api.ResultMessage
 	pollInterval            time.Duration
 	batchSize               int
+	retryQueueName          string
 	activeReleases          sync.Map
 	gate                    pipeline.Gate
 	gateFactory             pipeline.GateFactory
@@ -116,6 +117,7 @@ func NewRedisSortedSetFlow(cfg SortedSetConfig, workerPools []pipeline.WorkerPoo
 		resultChannel:          make(chan api.ResultMessage, resultChannelBuffer),
 		pollInterval:           time.Duration(cfg.PollIntervalMs) * time.Millisecond,
 		batchSize:              cfg.BatchSize,
+		retryQueueName:         cfg.RetryQueueName,
 		defaultResultQueueName: cfg.ResultQueueName,
 		workerPools:            workerPools,
 		gateFactory:            gateFactory,
@@ -226,6 +228,9 @@ func (r *RedisSortedSetFlow) Start(ctx context.Context) {
 			r.requestWorker(consumeCtx, ch.channel.Channel, ch.queueName, ch.queueID)
 		}(ch)
 	}
+	r.consumeWg.Add(1)
+	go func() { defer r.consumeWg.Done(); r.retryMover(consumeCtx) }()
+
 	r.drainWg.Add(2)
 	go func() { defer r.drainWg.Done(); r.retryWorker(drainCtx) }()  // #nosec G118
 	go func() { defer r.drainWg.Done(); r.resultWorker(drainCtx) }() // #nosec G118
@@ -575,15 +580,24 @@ func (r *RedisSortedSetFlow) flushRetryBatch(ctx context.Context, batch []pipeli
 		if queueName == "" {
 			queueName = r.defaultRequestQueueName
 		}
+		// Preserve the origin queue in the envelope so the retry mover can
+		// re-enter the message into the right queue once it is due.
+		msg.RequestQueueName = queueName
 		bytes, err := json.Marshal(msg.InternalRequest)
 		if err != nil {
 			logger.V(logutil.DEFAULT).Error(err, "Failed to marshal retry")
 			continue
 		}
 
+		// Score is the retry-due time. The retry queue is drained by the
+		// retry mover strictly at or after this time, so the backoff is
+		// enforced. Retries must NOT be ZADDed into the request queue
+		// directly: there the score means deadline and ZPopMin would pop a
+		// future-scored retry immediately (and ahead of all fresh traffic,
+		// since now+backoff sorts below any realistic deadline).
 		retryScore := float64(time.Now().Unix()) + msg.BackoffDurationSeconds
 		entries = append(entries, retryEntry{
-			queue: queueName,
+			queue: r.retryQueue(),
 			value: redis.Z{Score: retryScore, Member: string(bytes)},
 		})
 	}
@@ -690,4 +704,64 @@ func (r *RedisSortedSetFlow) marshalResult(msg api.ResultMessage) string {
 	fallback := map[string]string{"id": msg.ID, "payload": `{"error":"marshal failed"}`}
 	fallbackBytes, _ := json.Marshal(fallback)
 	return string(fallbackBytes)
+}
+
+// retryQueue returns the retry queue name, defaulting for flows constructed
+// directly (tests) without ApplyDefaults.
+func (r *RedisSortedSetFlow) retryQueue() string {
+	if r.retryQueueName == "" {
+		return "retry-sortedset"
+	}
+	return r.retryQueueName
+}
+
+// retryMover re-enters due retries into their request queues. Retries wait in
+// the retry queue scored by retry-due time; once due, they return to their
+// origin queue with the message's original deadline as the score, restoring
+// earliest-deadline-first ordering among fresh traffic.
+func (r *RedisSortedSetFlow) retryMover(ctx context.Context) {
+	logger := log.FromContext(ctx)
+	ticker := time.NewTicker(r.pollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			now := float64(time.Now().Unix())
+			members, err := r.rdb.ZRangeArgs(ctx, redis.ZRangeArgs{
+				Key: r.retryQueue(), ByScore: true,
+				Start: "-inf", Stop: fmt.Sprintf("%f", now),
+				Count: int64(r.batchSize), Offset: 0,
+			}).Result()
+			if err != nil || len(members) == 0 {
+				continue
+			}
+			for _, member := range members {
+				// ZRem guards against double-move: only the remover that wins
+				// the removal re-enters the message.
+				removed, err := r.rdb.ZRem(ctx, r.retryQueue(), member).Result()
+				if err != nil || removed == 0 {
+					continue
+				}
+				var ir api.InternalRequest
+				if err := json.Unmarshal([]byte(member), &ir); err != nil || ir.PublicRequest == nil {
+					logger.V(logutil.DEFAULT).Error(err, "Failed to parse due retry, dropping", "member", member[:min(len(member), 120)])
+					continue
+				}
+				queueName := ir.RequestQueueName
+				if queueName == "" {
+					queueName = r.defaultRequestQueueName
+				}
+				if err := r.rdb.ZAdd(ctx, queueName, redis.Z{
+					Score:  float64(ir.PublicRequest.ReqDeadline()),
+					Member: member,
+				}).Err(); err != nil {
+					logger.V(logutil.DEFAULT).Error(err, "Failed to re-enter due retry", "queue", queueName)
+					// Put it back in the retry queue so it is not lost.
+					_ = r.rdb.ZAdd(ctx, r.retryQueue(), redis.Z{Score: now, Member: member}).Err()
+				}
+			}
+		}
+	}
 }

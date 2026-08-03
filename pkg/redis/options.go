@@ -79,7 +79,11 @@ func (c *PubSubConfig) Validate() error {
 // SortedSetConfig is the transport config for the Redis sorted-set flow.
 // It is parsed from JSON provided via --transport-config or --transport-config-file.
 type SortedSetConfig struct {
-	URL             string                 `json:"url,omitempty"`
+	URL string `json:"url,omitempty"`
+	// RetryQueueName is the sorted set holding backoff retries, scored by
+	// retry-due time. Retries re-enter their request queue (with the original
+	// deadline score) only once due, so backoff is actually enforced.
+	RetryQueueName  string                 `json:"retry_queue_name,omitempty"`
 	ResultQueueName string                 `json:"result_queue_name,omitempty"`
 	PollIntervalMs  int                    `json:"poll_interval_ms,omitempty"`
 	BatchSize       int                    `json:"batch_size,omitempty"`
@@ -111,6 +115,9 @@ func (c *SortedSetConfig) ApplyEnvOverrides() {
 }
 
 func (c *SortedSetConfig) ApplyDefaults() {
+	if c.RetryQueueName == "" {
+		c.RetryQueueName = "retry-sortedset"
+	}
 	if c.ResultQueueName == "" {
 		c.ResultQueueName = "result-list"
 	}

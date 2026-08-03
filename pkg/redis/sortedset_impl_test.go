@@ -489,14 +489,42 @@ func TestSortedSetFlow_RetryBackoff(t *testing.T) {
 	flow.retryChannel <- retryMsg
 	time.Sleep(100 * time.Millisecond)
 
-	results, _ := rdb.ZRangeWithScores(ctx, queue, 0, -1).Result()
-	if len(results) != 1 {
-		t.Fatalf("Expected 1 retry message, got %d", len(results))
+	// The retry parks in the retry queue scored by its due time, NOT in the
+	// request queue (where the score means deadline and ZPopMin would pop a
+	// future-scored retry immediately).
+	if n, _ := rdb.ZCard(ctx, queue).Result(); n != 0 {
+		t.Fatalf("Expected request queue empty before backoff elapses, got %d entries", n)
 	}
-
+	results, _ := rdb.ZRangeWithScores(ctx, flow.retryQueue(), 0, -1).Result()
+	if len(results) != 1 {
+		t.Fatalf("Expected 1 message in retry queue, got %d", len(results))
+	}
 	expectedScore := float64(time.Now().Unix()) + 2.0
 	if results[0].Score < expectedScore-1 || results[0].Score > expectedScore+1 {
-		t.Errorf("Retry score incorrect: expected ~%f, got %f", expectedScore, results[0].Score)
+		t.Errorf("Retry due-time score incorrect: expected ~%f, got %f", expectedScore, results[0].Score)
+	}
+
+	// Once due, the mover re-enters it into the request queue with the
+	// original deadline as the score.
+	go flow.retryMover(ctx)
+	s.FastForward(3 * time.Second)
+	deadlineCheck := time.After(3 * time.Second)
+	for {
+		entries, _ := rdb.ZRangeWithScores(ctx, queue, 0, -1).Result()
+		if len(entries) == 1 {
+			if entries[0].Score != 9999999999 {
+				t.Errorf("Re-entered retry should carry deadline score, got %f", entries[0].Score)
+			}
+			if n, _ := rdb.ZCard(ctx, flow.retryQueue()).Result(); n != 0 {
+				t.Errorf("Retry queue should be empty after move, got %d", n)
+			}
+			break
+		}
+		select {
+		case <-deadlineCheck:
+			t.Fatal("timed out waiting for due retry to re-enter request queue")
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 }
 
@@ -1192,7 +1220,7 @@ func TestSortedSetFlow_RetryWorkerDrainsOnShutdown(t *testing.T) {
 		t.Fatal("retryWorker did not stop after context cancellation")
 	}
 
-	count, err := rdb.ZCard(ctx, queue).Result()
+	count, err := rdb.ZCard(ctx, flow.retryQueue()).Result()
 	if err != nil {
 		t.Fatalf("ZCard error: %v", err)
 	}
@@ -1242,7 +1270,7 @@ func TestSortedSetFlow_RetryBatchAfterFailure(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		count, err := rdb.ZCard(ctx, queue).Result()
+		count, err := rdb.ZCard(ctx, flow.retryQueue()).Result()
 		if err == nil && count == 1 {
 			return
 		}
@@ -1679,10 +1707,11 @@ func TestNewRedisSortedSetFlow_DefaultsWorkerPoolIDInConfigMap(t *testing.T) {
 }
 
 // TestNewRedisSortedSetFlow_RetryFallsBackToFirstQueue is a regression test: a
-// retry message that carries no RequestQueueName must be re-enqueued to a real
+// retry message that carries no RequestQueueName must be destined for a real
 // queue key, not "". NewRedisSortedSetFlow seeds defaultRequestQueueName from
-// the first configured queue; without that seed flushRetryBatch ZADDs the retry
-// to the empty key "" and the message is lost.
+// the first configured queue; without that seed flushRetryBatch would stamp ""
+// into the parked retry's envelope and the mover would re-enter it on the
+// empty key, losing the message.
 func TestNewRedisSortedSetFlow_RetryFallsBackToFirstQueue(t *testing.T) {
 	s := miniredis.RunT(t)
 	defer s.Close()
@@ -1717,8 +1746,18 @@ func TestNewRedisSortedSetFlow_RetryFallsBackToFirstQueue(t *testing.T) {
 
 	flow.flushRetryBatch(context.Background(), []pipeline.RetryMessage{retryMsg})
 
-	if n, _ := flow.rdb.ZCard(context.Background(), primaryQueue).Result(); n != 1 {
-		t.Errorf("Expected retry re-enqueued to %q (ZCARD=1), got ZCARD=%d", primaryQueue, n)
+	// The retry parks in the retry queue with the seeded queue name stamped
+	// into its envelope, so the mover re-enters it on a real key.
+	members, _ := flow.rdb.ZRange(context.Background(), flow.retryQueue(), 0, -1).Result()
+	if len(members) != 1 {
+		t.Fatalf("Expected 1 parked retry in %q, got %d", flow.retryQueue(), len(members))
+	}
+	var ir api.InternalRequest
+	if err := json.Unmarshal([]byte(members[0]), &ir); err != nil {
+		t.Fatalf("Failed to parse parked retry: %v", err)
+	}
+	if ir.RequestQueueName != primaryQueue {
+		t.Errorf("Parked retry envelope queue = %q, want %q", ir.RequestQueueName, primaryQueue)
 	}
 	if n, _ := flow.rdb.ZCard(context.Background(), "").Result(); n != 0 {
 		t.Errorf("Retry landed on the empty key \"\" (ZCARD=%d); default request queue was not seeded", n)
