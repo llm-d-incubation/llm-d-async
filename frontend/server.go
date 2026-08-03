@@ -172,7 +172,8 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	case stateReady:
 		s.metrics.fetchTotal.WithLabelValues("ready").Inc()
 		w.Header().Set(s.cfg.RequestIDHeader, id)
-		writeResult(w, res)
+		// Fetch stays non-destructive: the client confirms receipt via DELETE.
+		_ = writeResult(w, res)
 	case statePending:
 		s.metrics.fetchTotal.WithLabelValues("pending").Inc()
 		writePending(w, id)
@@ -427,7 +428,17 @@ func (s *Server) waitForResult(w http.ResponseWriter, r *http.Request, req *infe
 		state, res, err := lookupResult(ctx, s.rdb, req.tenant, req.id)
 		if err == nil && state == stateReady {
 			s.metrics.waitOutcomes.WithLabelValues("result").Inc()
-			writeResult(w, res)
+			if writeResult(w, res) == nil {
+				// Delivery confirmed on the held connection, the result's only
+				// consumer: reclaim the mailbox now instead of letting it sit
+				// out the full result TTL. On write failure the key stays, as
+				// the client may still fetch by id.
+				delCtx, delCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer delCancel()
+				if err := s.rdb.Del(delCtx, resultKey(req.tenant, req.id)).Err(); err != nil {
+					s.logger.Warn("failed to delete delivered result", "id", req.id, "error", err)
+				}
+			}
 			return
 		}
 		select {

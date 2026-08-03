@@ -15,7 +15,9 @@ import (
 // fetching a result requires knowing both the tenant and the id: a caller
 // presenting the wrong tenant simply finds nothing. Messages enqueued by the
 // frontend set result_queue_name to this key, and the AP's result writer
-// delivers there. Reads are non-destructive: the key expires via its TTL.
+// delivers there. Fetch reads are non-destructive (the key expires via its
+// TTL, or earlier via DELETE); wait mode deletes the key once the result is
+// delivered on the held connection, its only consumer.
 func resultKey(tenant, id string) string {
 	return resultKeyPrefix + tenant + ":" + id
 }
@@ -78,12 +80,14 @@ func writeOpenAIError(w http.ResponseWriter, status int, errType, code, msg stri
 // mirrors the upstream status and body verbatim. Error codes map per the
 // design: GATE_DROPPED -> 429, DEADLINE_EXCEEDED -> 504, INVALID_REQUEST ->
 // 400, everything else -> 502, wrapped in the OpenAI error envelope.
-func writeResult(w http.ResponseWriter, res *api.ResultMessage) {
+// Returns the body write error so callers that confirm delivery can act on
+// it; the error-envelope branches always return nil.
+func writeResult(w http.ResponseWriter, res *api.ResultMessage) error {
 	if res.StatusCode > 0 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(res.StatusCode)
-		_, _ = w.Write([]byte(res.Payload))
-		return
+		_, err := w.Write([]byte(res.Payload))
+		return err
 	}
 	switch res.ErrorCode {
 	case api.ErrCodeGateDropped:
@@ -99,4 +103,5 @@ func writeResult(w http.ResponseWriter, res *api.ResultMessage) {
 	default:
 		writeOpenAIError(w, http.StatusBadGateway, "api_error", res.ErrorCode, res.ErrorMessage)
 	}
+	return nil
 }

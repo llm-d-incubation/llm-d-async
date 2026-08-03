@@ -248,6 +248,12 @@ func TestWaitModeReturnsResult(t *testing.T) {
 		map[string]string{"X-AP-Mode": "wait", "X-Request-Id": "wait-1"})
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	assert.JSONEq(t, `{"waited":true}`, rec.Body.String())
+
+	// Delivery on the held connection consumes the mailbox: the key is
+	// reclaimed eagerly instead of lingering until its TTL.
+	exists, err := env.rdb.Exists(t.Context(), resultKey(defaultTenant, "wait-1")).Result()
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), exists, "delivered wait result should be deleted")
 }
 
 func TestWaitModeCapFallsBackToPending(t *testing.T) {
