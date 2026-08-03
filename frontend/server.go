@@ -240,12 +240,20 @@ func (s *Server) parseInference(r *http.Request) (*inferenceRequest, int, string
 		return nil, http.StatusBadRequest, "stream is only supported in direct mode"
 	}
 
+	// The result key joins tenant and id with ":", so a ":" in either would
+	// alias another (tenant, id) pair's key and leak results across tenants.
 	tenant := r.Header.Get(s.cfg.TenantHeader)
 	if tenant == "" {
 		tenant = defaultTenant
 	}
+	if strings.Contains(tenant, ":") {
+		return nil, http.StatusBadRequest, fmt.Sprintf("%s must not contain %q", s.cfg.TenantHeader, ":")
+	}
 
 	id := r.Header.Get(s.cfg.RequestIDHeader)
+	if strings.Contains(id, ":") {
+		return nil, http.StatusBadRequest, fmt.Sprintf("%s must not contain %q", s.cfg.RequestIDHeader, ":")
+	}
 	if id == "" {
 		var buf [16]byte
 		if _, err := rand.Read(buf[:]); err != nil {

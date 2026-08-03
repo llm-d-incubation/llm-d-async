@@ -277,6 +277,16 @@ func TestValidation(t *testing.T) {
 	rec = post(h, "/v1/chat/completions",
 		`{"model":"test-model"}`, map[string]string{"X-AP-Mode": "bogus"})
 	assert.Equal(t, http.StatusBadRequest, rec.Code, "unknown mode")
+
+	// A ":" in the tenant or client id would alias another pair's result key
+	// (tenant "a" + id "b:c" vs tenant "a:b" + id "c" -> results:req:a:b:c).
+	rec = post(h, "/v1/chat/completions",
+		`{"model":"test-model"}`, map[string]string{"X-AP-Mode": "enqueue", "X-Team": "a:b"})
+	assert.Equal(t, http.StatusBadRequest, rec.Code, "colon in tenant")
+
+	rec = post(h, "/v1/chat/completions",
+		`{"model":"test-model"}`, map[string]string{"X-AP-Mode": "enqueue", "X-Team": "a", "X-Request-Id": "b:c"})
+	assert.Equal(t, http.StatusBadRequest, rec.Code, "colon in request id")
 }
 
 func TestConfiguredDefaultMode(t *testing.T) {
