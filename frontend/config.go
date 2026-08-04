@@ -237,7 +237,7 @@ func (c *Config) validate() error {
 
 // LoadConfig reads and validates a YAML config file.
 func LoadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- path from trusted CLI flag
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
