@@ -45,10 +45,11 @@ routes:
     tier: "interactive"
 ```
 
-All keys and their defaults are documented in [config.go](config.go). Two AP-side settings matter for the queued modes:
+All keys and their defaults are documented in [config.go](config.go). Three AP-side settings matter for the queued modes:
 
 1. The queues the frontend targets must not set `result_queue_name` in the AP queue config, so the per-request result key routing applies.
 2. Set `result_ttl_seconds` on those queues so unfetched results expire.
+3. For fairness arbitration at the gateway, set `fairness_attribute` in the merge policy parameters to the frontend's quota attribute (default `team`), so the AP stamps queued dispatches with the same tenant identity the frontend keys quota on and stamps on its direct path.
 
 Wait mode wakes on Redis keyspace notifications when `notify-keyspace-events` includes `K` and `l`, and falls back to polling otherwise (`wakeupMode` controls this).
 

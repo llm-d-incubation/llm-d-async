@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/llm-d/llm-d-async/api"
 	"sigs.k8s.io/yaml"
 )
 
@@ -216,7 +217,7 @@ func (c *Config) applyDefaults() {
 		c.ObjectiveHeader = "x-llm-d-inference-objective"
 	}
 	if c.FairnessHeader == "" {
-		c.FairnessHeader = "x-llm-d-inference-fairness-id"
+		c.FairnessHeader = api.FairnessIDHeader
 	}
 }
 
