@@ -130,6 +130,7 @@ The JSON document is transport-specific. Its `queues`/`topics` entries use the s
 {
   "url": "redis://user:pass@host:6379/0",
   "result_queue_name": "result-list",
+  "retry_queue_name": "retry-sortedset",
   "poll_interval_ms": 1000,
   "batch_size": 10,
   "enable_tracing": false,

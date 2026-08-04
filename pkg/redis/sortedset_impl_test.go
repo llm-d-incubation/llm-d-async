@@ -505,10 +505,11 @@ func TestSortedSetFlow_RetryBackoff(t *testing.T) {
 	}
 
 	// Once due, the mover re-enters it into the request queue with the
-	// original deadline as the score.
+	// original deadline as the score. The mover compares scores against
+	// wall-clock time (miniredis.FastForward cannot advance time.Now()), so
+	// this waits out the 2s backoff in real time.
 	go flow.retryMover(ctx)
-	s.FastForward(3 * time.Second)
-	deadlineCheck := time.After(3 * time.Second)
+	deadlineCheck := time.After(5 * time.Second)
 	for {
 		entries, _ := rdb.ZRangeWithScores(ctx, queue, 0, -1).Result()
 		if len(entries) == 1 {

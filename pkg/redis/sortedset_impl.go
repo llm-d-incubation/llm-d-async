@@ -734,7 +734,11 @@ func (r *RedisSortedSetFlow) retryMover(ctx context.Context) {
 				Start: "-inf", Stop: fmt.Sprintf("%f", now),
 				Count: int64(r.batchSize), Offset: 0,
 			}).Result()
-			if err != nil || len(members) == 0 {
+			if err != nil {
+				logger.V(logutil.DEFAULT).Error(err, "Failed to read due retries", "queue", r.retryQueue())
+				continue
+			}
+			if len(members) == 0 {
 				continue
 			}
 			for _, member := range members {
