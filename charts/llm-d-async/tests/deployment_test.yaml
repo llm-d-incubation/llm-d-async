@@ -458,3 +458,23 @@ tests:
       - notContains:
           path: spec.template.spec.containers[0].args
           content: --request-merge-policy-config=/etc/llm-d-async/config/request-merge-policy.json
+
+  - it: should render extra env vars when ap.env is set
+    set:
+      ap.env:
+        - name: PUBSUB_EMULATOR_HOST
+          value: "pubsub-emulator:8085"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PUBSUB_EMULATOR_HOST
+            value: "pubsub-emulator:8085"
+
+  - it: should not render extra env vars when ap.env is empty
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PUBSUB_EMULATOR_HOST
+            value: "pubsub-emulator:8085"

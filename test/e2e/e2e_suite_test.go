@@ -66,7 +66,7 @@ var (
 	eppImage         = env.GetEnvString("EPP_IMAGE", "registry.k8s.io/gateway-api-inference-extension/epp:v1.5.0", ginkgo.GinkgoLogr)
 	simImage         = env.GetEnvString("SIM_IMAGE", "ghcr.io/llm-d/llm-d-inference-sim:v0.10.0", ginkgo.GinkgoLogr)
 	redisImage       = env.GetEnvString("REDIS_IMAGE", "valkey/valkey:8-alpine", ginkgo.GinkgoLogr)
-	pubsubImage      = env.GetEnvString("PUBSUB_IMAGE", "gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators", ginkgo.GinkgoLogr)
+	pubsubImage      = env.GetEnvString("PUBSUB_IMAGE", "gcr.io/google.com/cloudsdktool/google-cloud-cli:513.0.0-emulators", ginkgo.GinkgoLogr)
 	gaieRoot         = os.Getenv("GAIE_ROOT")
 	simRoot          = os.Getenv("SIM_ROOT")
 
@@ -478,7 +478,7 @@ func setupClients() {
 	ginkgo.By("Creating PubSub client on localhost:" + pubsubPort)
 	gomega.Expect(os.Setenv("PUBSUB_EMULATOR_HOST", "localhost:"+pubsubPort)).To(gomega.Succeed())
 	var err error
-	pubsubClient, err = pubsub.NewClient(context.Background(), "test-project")
+	pubsubClient, err = pubsub.NewClient(context.Background(), pubsubProjectID)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 	ginkgo.By("Waiting for Prometheus to be ready")
@@ -715,14 +715,18 @@ func setupPubSubEmulatorTopicsAndSubscriptions() {
 	ctx := context.Background()
 	gomega.Expect(os.Setenv("PUBSUB_EMULATOR_HOST", "localhost:"+pubsubPort)).To(gomega.Succeed())
 
+	reqTopic := fmt.Sprintf("projects/%s/topics/%s", pubsubProjectID, pubsubRequestTopic)
+	resTopic := fmt.Sprintf("projects/%s/topics/%s", pubsubProjectID, pubsubResultTopic)
+	reqSub := fmt.Sprintf("projects/%s/subscriptions/%s", pubsubProjectID, pubsubRequestSub)
+	resSub := fmt.Sprintf("projects/%s/subscriptions/%s", pubsubProjectID, pubsubResultSub)
+
 	var client *pubsub.Client
 	gomega.Eventually(func() error {
 		var err error
-		client, err = pubsub.NewClient(ctx, "test-project")
+		client, err = pubsub.NewClient(ctx, pubsubProjectID)
 		if err != nil {
 			return err
 		}
-		reqTopic := "projects/test-project/topics/pubsub-e2e-request-topic"
 		_, err = client.TopicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{Name: reqTopic})
 		if err != nil && status.Code(err) != codes.AlreadyExists {
 			_ = client.Close()
@@ -732,10 +736,6 @@ func setupPubSubEmulatorTopicsAndSubscriptions() {
 	}, 120*time.Second, 2*time.Second).Should(gomega.Succeed())
 	defer client.Close() //nolint:errcheck
 
-	resTopic := "projects/test-project/topics/pubsub-e2e-result-topic"
-	reqSub := "projects/test-project/subscriptions/pubsub-e2e-request-sub"
-	resSub := "projects/test-project/subscriptions/pubsub-e2e-result-sub"
-
 	_, err := client.TopicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{Name: resTopic})
 	if err != nil && status.Code(err) != codes.AlreadyExists {
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
@@ -743,7 +743,7 @@ func setupPubSubEmulatorTopicsAndSubscriptions() {
 
 	_, err = client.SubscriptionAdminClient.CreateSubscription(ctx, &pubsubpb.Subscription{
 		Name:  reqSub,
-		Topic: "projects/test-project/topics/pubsub-e2e-request-topic",
+		Topic: reqTopic,
 	})
 	if err != nil && status.Code(err) != codes.AlreadyExists {
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())

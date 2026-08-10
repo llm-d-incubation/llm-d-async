@@ -16,6 +16,7 @@ var _ = ginkgo.Describe("GCP PubSub Integration", func() {
 		ctx = context.Background()
 		setSimWaitingRequests(simAdminURL, 0)
 		setEnvoyFaultAbort(envoyAdminURL, 0)
+		drainPubSubResults(ctx, pubsubClient, pubsubResultSub)
 	})
 
 	ginkgo.AfterEach(func() {

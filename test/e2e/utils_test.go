@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -47,6 +48,7 @@ const (
 	benchmarkPoolGateRequestQueue = "benchmark-pool-gate-request-sortedset"
 	benchmarkPoolGateResultQueue  = "benchmark-pool-gate-result-list"
 
+	pubsubProjectID    = "test-project"
 	pubsubRequestTopic = "pubsub-e2e-request-topic"
 	pubsubRequestSub   = "pubsub-e2e-request-sub"
 	pubsubResultTopic  = "pubsub-e2e-result-topic"
@@ -134,24 +136,42 @@ func enqueuePubSubMessages(ctx context.Context, client *pubsub.Client, topic str
 
 func popPubSubResult(ctx context.Context, client *pubsub.Client, subName string) *api.ResultMessage {
 	sub := client.Subscriber(subName)
+	sub.ReceiveSettings.MaxOutstandingMessages = 1
+	sub.ReceiveSettings.NumGoroutines = 1
+
 	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
 	var result *api.ResultMessage
 	var mu sync.Mutex
-	_ = sub.Receive(cctx, func(rctx context.Context, msg *pubsub.Message) {
+	err := sub.Receive(cctx, func(rctx context.Context, msg *pubsub.Message) {
 		mu.Lock()
 		defer mu.Unlock()
 		if result == nil {
 			var r api.ResultMessage
 			if json.Unmarshal(msg.Data, &r) == nil {
 				result = &r
+				msg.Ack()
+				cancel()
+				return
 			}
 		}
-		msg.Ack()
-		cancel()
+		msg.Nack()
 	})
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		ginkgo.GinkgoLogr.V(1).Info("popPubSubResult receive error", "error", err, "sub", subName)
+	}
 	return result
+}
+
+func drainPubSubResults(ctx context.Context, client *pubsub.Client, subName string) {
+	dctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	for dctx.Err() == nil {
+		if popPubSubResult(dctx, client, subName) == nil {
+			break
+		}
+	}
 }
 
 func makeRequestMessage(id string, deadlineOffset time.Duration) api.RequestMessage {

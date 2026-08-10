@@ -51,6 +51,12 @@ ap:
   drainTimeout: "2m"
   prometheusURL: ""
   prometheusCacheTTL: ""
+  # Extra environment variables to inject into the processor container.
+  # Useful for passing backend-specific configuration like PUBSUB_EMULATOR_HOST.
+  # env:
+  #   - name: PUBSUB_EMULATOR_HOST
+  #     value: "pubsub-emulator:8085"
+  env: []
   # Named worker pools configuration. When specified, overrides the global concurrency option.
   # workerPools:
   #   - id: "default"
