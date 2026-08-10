@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 
+	"cloud.google.com/go/pubsub/v2"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	"github.com/redis/go-redis/v9"
@@ -44,6 +46,11 @@ const (
 
 	benchmarkPoolGateRequestQueue = "benchmark-pool-gate-request-sortedset"
 	benchmarkPoolGateResultQueue  = "benchmark-pool-gate-result-list"
+
+	pubsubRequestTopic = "pubsub-e2e-request-topic"
+	pubsubRequestSub   = "pubsub-e2e-request-sub"
+	pubsubResultTopic  = "pubsub-e2e-result-topic"
+	pubsubResultSub    = "pubsub-e2e-result-sub"
 )
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
@@ -103,6 +110,48 @@ func popResult(ctx context.Context, rdb *redis.Client, queue string) *api.Result
 	var msg api.ResultMessage
 	gomega.ExpectWithOffset(1, json.Unmarshal([]byte(val), &msg)).To(gomega.Succeed())
 	return &msg
+}
+
+func enqueuePubSubMessage(ctx context.Context, client *pubsub.Client, topic string, msg api.RequestMessage) {
+	data, err := json.Marshal(msg)
+	gomega.ExpectWithOffset(1, err).NotTo(gomega.HaveOccurred())
+	pubMsg := &pubsub.Message{
+		Data: data,
+	}
+	if msg.Metadata != nil {
+		pubMsg.Attributes = msg.Metadata
+	}
+	res := client.Publisher(topic).Publish(ctx, pubMsg)
+	_, err = res.Get(ctx)
+	gomega.ExpectWithOffset(1, err).NotTo(gomega.HaveOccurred())
+}
+
+func enqueuePubSubMessages(ctx context.Context, client *pubsub.Client, topic string, msgs ...api.RequestMessage) {
+	for _, msg := range msgs {
+		enqueuePubSubMessage(ctx, client, topic, msg)
+	}
+}
+
+func popPubSubResult(ctx context.Context, client *pubsub.Client, subName string) *api.ResultMessage {
+	sub := client.Subscriber(subName)
+	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	var result *api.ResultMessage
+	var mu sync.Mutex
+	_ = sub.Receive(cctx, func(rctx context.Context, msg *pubsub.Message) {
+		mu.Lock()
+		defer mu.Unlock()
+		if result == nil {
+			var r api.ResultMessage
+			if json.Unmarshal(msg.Data, &r) == nil {
+				result = &r
+			}
+		}
+		msg.Ack()
+		cancel()
+	})
+	return result
 }
 
 func makeRequestMessage(id string, deadlineOffset time.Duration) api.RequestMessage {

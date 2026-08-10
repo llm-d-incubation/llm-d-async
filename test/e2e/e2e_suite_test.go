@@ -22,7 +22,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	k8slog "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"cloud.google.com/go/pubsub/v2"
+	"cloud.google.com/go/pubsub/v2/apiv1/pubsubpb"
 	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/util/env"
 	testutils "sigs.k8s.io/gateway-api-inference-extension/test/utils"
 )
@@ -33,6 +37,7 @@ const (
 
 	// Manifests
 	redisManifest      = "./yaml/redis.yaml"
+	pubsubManifest     = "./yaml/pubsub.yaml"
 	simManifest        = "./yaml/sim.yaml"
 	eppManifest        = "./yaml/epp.yaml"
 	eppConfigNoFC      = "./yaml/epp-config-no-fc.yaml"
@@ -49,6 +54,7 @@ const (
 
 var (
 	redisPort      string = env.GetEnvString("E2E_INTEGRATION_REDIS_PORT", "30480", ginkgo.GinkgoLogr)
+	pubsubPort     string = env.GetEnvString("E2E_INTEGRATION_PUBSUB_PORT", "30485", ginkgo.GinkgoLogr)
 	promPort       string = env.GetEnvString("E2E_INTEGRATION_PROM_PORT", "30491", ginkgo.GinkgoLogr)
 	simPort        string = env.GetEnvString("E2E_INTEGRATION_SIM_PORT", "30490", ginkgo.GinkgoLogr)
 	envoyPort      string = env.GetEnvString("E2E_INTEGRATION_ENVOY_PORT", "30492", ginkgo.GinkgoLogr)
@@ -60,6 +66,7 @@ var (
 	eppImage         = env.GetEnvString("EPP_IMAGE", "registry.k8s.io/gateway-api-inference-extension/epp:v1.5.0", ginkgo.GinkgoLogr)
 	simImage         = env.GetEnvString("SIM_IMAGE", "ghcr.io/llm-d/llm-d-inference-sim:v0.10.0", ginkgo.GinkgoLogr)
 	redisImage       = env.GetEnvString("REDIS_IMAGE", "valkey/valkey:8-alpine", ginkgo.GinkgoLogr)
+	pubsubImage      = env.GetEnvString("PUBSUB_IMAGE", "gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators", ginkgo.GinkgoLogr)
 	gaieRoot         = os.Getenv("GAIE_ROOT")
 	simRoot          = os.Getenv("SIM_ROOT")
 
@@ -70,6 +77,7 @@ var (
 	kindKubeconfig string
 
 	rdb           *redis.Client
+	pubsubClient  *pubsub.Client
 	promURL       string
 	simAdminURL   string
 	envoyURL      string
@@ -95,6 +103,9 @@ var _ = ginkgo.BeforeSuite(func() {
 })
 
 var _ = ginkgo.AfterSuite(func() {
+	if pubsubClient != nil {
+		pubsubClient.Close() //nolint:errcheck
+	}
 	if rdb != nil {
 		rdb.Close() //nolint:errcheck
 	}
@@ -181,6 +192,7 @@ func setupK8sCluster() {
 			gomega.Expect(stdin.Close()).To(gomega.Succeed())
 		}()
 		cfg := strings.ReplaceAll(kindClusterConfig, "${REDIS_PORT}", redisPort)
+		cfg = strings.ReplaceAll(cfg, "${PUBSUB_PORT}", pubsubPort)
 		cfg = strings.ReplaceAll(cfg, "${PROM_PORT}", promPort)
 		cfg = strings.ReplaceAll(cfg, "${SIM_PORT}", simPort)
 		cfg = strings.ReplaceAll(cfg, "${ENVOY_PORT}", envoyPort)
@@ -225,6 +237,9 @@ func setupK8sCluster() {
 
 	pullIfMissing(redisImage)
 	kindLoadImage(redisImage)
+
+	pullIfMissing(pubsubImage)
+	kindLoadImage(pubsubImage)
 
 	pullIfMissing("docker.io/envoyproxy/envoy:distroless-v1.33.2")
 	kindLoadImage("docker.io/envoyproxy/envoy:distroless-v1.33.2")
@@ -322,6 +337,18 @@ func applyManifests() {
 	ginkgo.By("Applying Redis manifest")
 	kubectlApplyFile(redisManifest, map[string]string{"${REDIS_IMAGE}": redisImage})
 
+	ginkgo.By("Applying PubSub emulator manifest")
+	kubectlApplyFile(pubsubManifest, map[string]string{"${PUBSUB_IMAGE}": pubsubImage})
+
+	ginkgo.By("Waiting for PubSub emulator deployment rollout")
+	cmd := exec.Command("kubectl", "--kubeconfig", kindKubeconfig,
+		"-n", nsName, "rollout", "status", "deployment/pubsub-emulator", "--timeout=60s")
+	sess, err := gexec.Start(cmd, ginkgo.GinkgoWriter, ginkgo.GinkgoWriter)
+	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+	gomega.Eventually(sess).WithTimeout(60 * time.Second).Should(gexec.Exit(0))
+
+	setupPubSubEmulatorTopicsAndSubscriptions()
+
 	ginkgo.By("Applying sim manifest")
 	kubectlApplyFile(simManifest, nil)
 	kubectlApplyFile(simDeployManifest, map[string]string{"${SIM_IMAGE}": simImage})
@@ -350,6 +377,7 @@ func applyManifests() {
 	imageRepo, imageTag := splitImage(apImage)
 	for _, r := range []struct{ name, values string }{
 		{"integration", helmValuesDir + "/integration.yaml"},
+		{"pubsub", helmValuesDir + "/pubsub.yaml"},
 		{"saturation", helmValuesDir + "/saturation.yaml"},
 		{"budget", helmValuesDir + "/budget.yaml"},
 		{"redis-gate", helmValuesDir + "/redis-gate.yaml"},
@@ -446,6 +474,12 @@ func setupClients() {
 	gomega.Eventually(func() error {
 		return rdb.Ping(context.Background()).Err()
 	}, 30*time.Second, 1*time.Second).Should(gomega.Succeed())
+
+	ginkgo.By("Creating PubSub client on localhost:" + pubsubPort)
+	gomega.Expect(os.Setenv("PUBSUB_EMULATOR_HOST", "localhost:"+pubsubPort)).To(gomega.Succeed())
+	var err error
+	pubsubClient, err = pubsub.NewClient(context.Background(), "test-project")
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 	ginkgo.By("Waiting for Prometheus to be ready")
 	gomega.Eventually(func(g gomega.Gomega) {
@@ -582,6 +616,7 @@ func doRedeployEPPWithFlowControl() {
 	// window can get 404s from Envoy that are classified as non-retryable.
 	for _, deploy := range []string{
 		"integration-llm-d-async",
+		"pubsub-llm-d-async",
 		"saturation-llm-d-async",
 		"budget-llm-d-async",
 		"redis-gate-llm-d-async",
@@ -604,6 +639,7 @@ func doRedeployEPPWithFlowControl() {
 	}
 	for _, deploy := range []string{
 		"integration-llm-d-async",
+		"pubsub-llm-d-async",
 		"saturation-llm-d-async",
 		"budget-llm-d-async",
 		"redis-gate-llm-d-async",
@@ -654,6 +690,9 @@ nodes:
   - containerPort: 30480
     hostPort: ${REDIS_PORT}
     protocol: TCP
+  - containerPort: 30485
+    hostPort: ${PUBSUB_PORT}
+    protocol: TCP
   - containerPort: 30491
     hostPort: ${PROM_PORT}
     protocol: TCP
@@ -670,3 +709,51 @@ nodes:
     hostPort: ${JAEGER_PORT}
     protocol: TCP
 `
+
+func setupPubSubEmulatorTopicsAndSubscriptions() {
+	ginkgo.By("Setting up PubSub emulator topics and subscriptions")
+	ctx := context.Background()
+	gomega.Expect(os.Setenv("PUBSUB_EMULATOR_HOST", "localhost:"+pubsubPort)).To(gomega.Succeed())
+
+	var client *pubsub.Client
+	gomega.Eventually(func() error {
+		var err error
+		client, err = pubsub.NewClient(ctx, "test-project")
+		if err != nil {
+			return err
+		}
+		reqTopic := "projects/test-project/topics/pubsub-e2e-request-topic"
+		_, err = client.TopicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{Name: reqTopic})
+		if err != nil && status.Code(err) != codes.AlreadyExists {
+			_ = client.Close()
+			return err
+		}
+		return nil
+	}, 120*time.Second, 2*time.Second).Should(gomega.Succeed())
+	defer client.Close() //nolint:errcheck
+
+	resTopic := "projects/test-project/topics/pubsub-e2e-result-topic"
+	reqSub := "projects/test-project/subscriptions/pubsub-e2e-request-sub"
+	resSub := "projects/test-project/subscriptions/pubsub-e2e-result-sub"
+
+	_, err := client.TopicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{Name: resTopic})
+	if err != nil && status.Code(err) != codes.AlreadyExists {
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+	}
+
+	_, err = client.SubscriptionAdminClient.CreateSubscription(ctx, &pubsubpb.Subscription{
+		Name:  reqSub,
+		Topic: "projects/test-project/topics/pubsub-e2e-request-topic",
+	})
+	if err != nil && status.Code(err) != codes.AlreadyExists {
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+	}
+
+	_, err = client.SubscriptionAdminClient.CreateSubscription(ctx, &pubsubpb.Subscription{
+		Name:  resSub,
+		Topic: resTopic,
+	})
+	if err != nil && status.Code(err) != codes.AlreadyExists {
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+	}
+}

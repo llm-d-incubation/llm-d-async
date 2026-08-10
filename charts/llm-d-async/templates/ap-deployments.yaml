@@ -131,6 +131,9 @@ spec:
                 name: {{ include "llm-d-async.redisSecretName" . }}
                 key: {{ include "llm-d-async.redisSecretKey" . }}
           {{- end }}
+          {{- with .Values.ap.env }}
+          {{- toYaml . | nindent 10 }}
+          {{- end }}
         name: llm-d-async
         ports:
           - name: metrics
