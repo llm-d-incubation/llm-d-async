@@ -7,6 +7,7 @@ IST = "IST"
 # `unmarshaling` is the standard Go/American spelling (typos suggests British).
 typ = "typ"
 unmarshaling = "unmarshaling"
+mis-sized="mis-sized"
 
 [files]
 extend-exclude = [
@@ -17,4 +18,9 @@ extend-exclude = [
     "go.sum",
     "build/",
     "testdata/"
+]
+
+[default]
+extend-ignore-words-re = [
+    "^mis-.*$",
 ]
