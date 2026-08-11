@@ -7,7 +7,6 @@ IST = "IST"
 # `unmarshaling` is the standard Go/American spelling (typos suggests British).
 typ = "typ"
 unmarshaling = "unmarshaling"
-mis-sized="mis-sized"
 
 [files]
 extend-exclude = [
@@ -21,6 +20,9 @@ extend-exclude = [
 ]
 
 [default]
-extend-ignore-words-re = [
-    "^mis-.*$",
+extend-ignore-re = [
+    # Ignore prefix 'mis-' case insensitive, so it ignores the false error on 'mis-sized' 
+    "(?i)mis-[[:alpha:]]+",
+    #Ignore zadd case insensitive so it ignore the false error on 'ZADDed' word.                                        
+    "(?i)zadd[[:alpha:]]+",
 ]

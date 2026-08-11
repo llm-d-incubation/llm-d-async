@@ -315,7 +315,7 @@ func (f *GateFactory) CreateGate(cfg pipeline.GateConfig) (pipeline.Gate, error)
 		// Report the resolved closing point. Every source in the cascade divides
 		// by max_concurrency per pod, so a value the pool can never reach leaves
 		// the gate permanently open with nothing in the logs or metrics to say so.
-		// Surfacing it here makes a miss-sized max_concurrency visible at startup.
+		// Surfacing it here makes a mis-sized max_concurrency visible at startup.
 		f.logger.Info("prometheus-budget gate configured",
 			"pool", pool,
 			"maxConcurrency", maxConcurrency,
