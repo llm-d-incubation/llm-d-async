@@ -25,6 +25,11 @@ type Request interface {
 // attribute reach the gateway with whatever the caller sent.
 const FairnessIDHeader = "x-llm-d-inference-fairness-id"
 
+// ObjectiveHeader is the request header llm-d-router reads to resolve a
+// request's InferenceObjective. The tier-priority merge policy stamps it with
+// the per-lane objective when lane_objectives is configured.
+const ObjectiveHeader = "x-llm-d-inference-objective"
+
 // RequestMessage contains the caller-visible fields of a request. Metadata is
 // caller-supplied pass-through data (e.g. tracing IDs, user labels). The system
 // never writes Metadata, and reads it only where an opt-in feature is configured

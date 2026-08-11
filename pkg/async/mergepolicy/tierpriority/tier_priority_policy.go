@@ -19,15 +19,15 @@ import (
 func init() {
 	plugins.MustRegister("tier-priority", func(name string, parameters json.RawMessage, handle plugins.Handle) (plugins.Plugin, error) {
 		var params struct {
-			PriorityHeader string `json:"priority_header"`
-			TierLabel      string `json:"tier_label"`
+			PriorityHeader  string `json:"priority_header"`
+			TierLabel       string `json:"tier_label"`
+			ObjectiveHeader string `json:"objective_header"`
 			// LaneObjectives maps lane keys ("reserved-interactive",
 			// "overflow-batch", ...) to InferenceObjective names stamped as
 			// ObjectiveHeader, replacing the per-queue objective for lane
 			// granularity. The numeric priority header has no consumer in
 			// upstream gateways. Objectives are how priority reaches them.
-			ObjectiveHeader string            `json:"objective_header"`
-			LaneObjectives  map[string]string `json:"lane_objectives"`
+			LaneObjectives map[string]string `json:"lane_objectives"`
 			fairness.Params
 		}
 		if len(parameters) > 0 {
@@ -44,7 +44,7 @@ func init() {
 			return nil, fmt.Errorf("invalid tier-priority parameters: priority_header %q is not a legal HTTP header name", params.PriorityHeader)
 		}
 		if params.ObjectiveHeader == "" {
-			params.ObjectiveHeader = "x-llm-d-inference-objective"
+			params.ObjectiveHeader = api.ObjectiveHeader
 		}
 		if !httpguts.ValidHeaderFieldName(params.ObjectiveHeader) {
 			return nil, fmt.Errorf("invalid tier-priority parameters: objective_header %q is not a legal HTTP header name", params.ObjectiveHeader)
@@ -81,8 +81,7 @@ type Config struct {
 	// identity. Empty falls back to fairness.DefaultAttribute.
 	FairnessAttribute string
 	// ObjectiveHeader is the HTTP header stamped with the lane's
-	// InferenceObjective name. Empty falls back to
-	// "x-llm-d-inference-objective".
+	// InferenceObjective name. Empty falls back to api.ObjectiveHeader.
 	ObjectiveHeader string
 	// LaneObjectives maps lane keys ("reserved-interactive", "overflow-batch",
 	// ...) to InferenceObjective names. Lanes without an entry are not
@@ -99,7 +98,7 @@ func NewTierPriorityPolicy(name string, cfg Config) *TierPriorityPolicy {
 	}
 	objectiveHeader := cfg.ObjectiveHeader
 	if objectiveHeader == "" {
-		objectiveHeader = "x-llm-d-inference-objective"
+		objectiveHeader = api.ObjectiveHeader
 	}
 	return &TierPriorityPolicy{
 		name:            name,
@@ -370,6 +369,9 @@ func (p *TierPriorityPolicy) MergeRequestChannels(channels []pipeline.RequestCha
 				headers := map[string]string{
 					"Content-Type": "application/json",
 				}
+				// Queue-level objective. For lanes configured in
+				// lane_objectives, the lane objective stamped below
+				// overrides it.
 				if chMeta.InferenceObjective != "" {
 					headers["x-gateway-inference-objective"] = chMeta.InferenceObjective
 				}
