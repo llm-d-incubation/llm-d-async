@@ -53,6 +53,11 @@ const (
 	pubsubRequestSub   = "pubsub-e2e-request-sub"
 	pubsubResultTopic  = "pubsub-e2e-result-topic"
 	pubsubResultSub    = "pubsub-e2e-result-sub"
+
+	pubsubBenchRequestTopic = "pubsub-bench-request-topic"
+	pubsubBenchRequestSub   = "pubsub-bench-request-sub"
+	pubsubBenchResultTopic  = "pubsub-bench-result-topic"
+	pubsubBenchResultSub    = "pubsub-bench-result-sub"
 )
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
@@ -128,9 +133,27 @@ func enqueuePubSubMessage(ctx context.Context, client *pubsub.Client, topic stri
 	gomega.ExpectWithOffset(1, err).NotTo(gomega.HaveOccurred())
 }
 
+// enqueuePubSubMessages enqueues multiple messages to a PubSub topic. It publishes
+// all messages concurrently before waiting on publish results, allowing the SDK's
+// internal bundler to batch requests into efficient RPCs for bulk benchmarks (e.g. 5,000 msgs)
+// without blocking sequentially on each message round-trip.
 func enqueuePubSubMessages(ctx context.Context, client *pubsub.Client, topic string, msgs ...api.RequestMessage) {
-	for _, msg := range msgs {
-		enqueuePubSubMessage(ctx, client, topic, msg)
+	publisher := client.Publisher(topic)
+	results := make([]*pubsub.PublishResult, len(msgs))
+	for i, msg := range msgs {
+		data, err := json.Marshal(msg)
+		gomega.ExpectWithOffset(1, err).NotTo(gomega.HaveOccurred())
+		pubMsg := &pubsub.Message{
+			Data: data,
+		}
+		if msg.Metadata != nil {
+			pubMsg.Attributes = msg.Metadata
+		}
+		results[i] = publisher.Publish(ctx, pubMsg)
+	}
+	for _, res := range results {
+		_, err := res.Get(ctx)
+		gomega.ExpectWithOffset(1, err).NotTo(gomega.HaveOccurred())
 	}
 }
 

@@ -392,6 +392,7 @@ func applyManifests() {
 		{"mt-merge", helmValuesDir + "/mt-merge.yaml"},
 		{"benchmark", helmValuesDir + "/benchmark.yaml"},
 		{"benchmark-pool-gate", helmValuesDir + "/benchmark-pool-gate.yaml"},
+		{"benchmark-pubsub", helmValuesDir + "/benchmark-pubsub.yaml"},
 	} {
 		helmInstall(r.name, r.values, map[string]string{
 			"ap.image.repository": imageRepo,
@@ -630,6 +631,7 @@ func doRedeployEPPWithFlowControl() {
 		"mt-merge-llm-d-async",
 		"benchmark-llm-d-async",
 		"benchmark-pool-gate-llm-d-async",
+		"benchmark-pubsub-llm-d-async",
 	} {
 		cmd := exec.Command("kubectl", "--kubeconfig", kindKubeconfig,
 			"-n", nsName, "rollout", "restart", "deployment/"+deploy)
@@ -653,6 +655,7 @@ func doRedeployEPPWithFlowControl() {
 		"mt-merge-llm-d-async",
 		"benchmark-llm-d-async",
 		"benchmark-pool-gate-llm-d-async",
+		"benchmark-pubsub-llm-d-async",
 	} {
 		cmd := exec.Command("kubectl", "--kubeconfig", kindKubeconfig,
 			"-n", nsName, "rollout", "status", "deployment/"+deploy, "--timeout=120s")
@@ -714,10 +717,25 @@ func setupPubSubEmulatorTopicsAndSubscriptions() {
 	ginkgo.By("Setting up PubSub emulator topics and subscriptions")
 	ctx := context.Background()
 
-	reqTopic := fmt.Sprintf("projects/%s/topics/%s", pubsubProjectID, pubsubRequestTopic)
-	resTopic := fmt.Sprintf("projects/%s/topics/%s", pubsubProjectID, pubsubResultTopic)
-	reqSub := fmt.Sprintf("projects/%s/subscriptions/%s", pubsubProjectID, pubsubRequestSub)
-	resSub := fmt.Sprintf("projects/%s/subscriptions/%s", pubsubProjectID, pubsubResultSub)
+	pairs := []struct {
+		reqTopic string
+		reqSub   string
+		resTopic string
+		resSub   string
+	}{
+		{
+			reqTopic: fmt.Sprintf("projects/%s/topics/%s", pubsubProjectID, pubsubRequestTopic),
+			reqSub:   fmt.Sprintf("projects/%s/subscriptions/%s", pubsubProjectID, pubsubRequestSub),
+			resTopic: fmt.Sprintf("projects/%s/topics/%s", pubsubProjectID, pubsubResultTopic),
+			resSub:   fmt.Sprintf("projects/%s/subscriptions/%s", pubsubProjectID, pubsubResultSub),
+		},
+		{
+			reqTopic: fmt.Sprintf("projects/%s/topics/%s", pubsubProjectID, pubsubBenchRequestTopic),
+			reqSub:   fmt.Sprintf("projects/%s/subscriptions/%s", pubsubProjectID, pubsubBenchRequestSub),
+			resTopic: fmt.Sprintf("projects/%s/topics/%s", pubsubProjectID, pubsubBenchResultTopic),
+			resSub:   fmt.Sprintf("projects/%s/subscriptions/%s", pubsubProjectID, pubsubBenchResultSub),
+		},
+	}
 
 	var client *pubsub.Client
 	gomega.Eventually(func() error {
@@ -726,33 +744,37 @@ func setupPubSubEmulatorTopicsAndSubscriptions() {
 		if err != nil {
 			return err
 		}
-		_, err = client.TopicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{Name: reqTopic})
-		if err != nil && status.Code(err) != codes.AlreadyExists {
-			_ = client.Close()
-			return err
+		for _, p := range pairs {
+			_, err = client.TopicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{Name: p.reqTopic})
+			if err != nil && status.Code(err) != codes.AlreadyExists {
+				_ = client.Close()
+				return err
+			}
 		}
 		return nil
 	}, 120*time.Second, 2*time.Second).Should(gomega.Succeed())
 	defer client.Close() //nolint:errcheck
 
-	_, err := client.TopicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{Name: resTopic})
-	if err != nil && status.Code(err) != codes.AlreadyExists {
-		gomega.Expect(err).NotTo(gomega.HaveOccurred())
-	}
+	for _, p := range pairs {
+		_, err := client.TopicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{Name: p.resTopic})
+		if err != nil && status.Code(err) != codes.AlreadyExists {
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		}
 
-	_, err = client.SubscriptionAdminClient.CreateSubscription(ctx, &pubsubpb.Subscription{
-		Name:  reqSub,
-		Topic: reqTopic,
-	})
-	if err != nil && status.Code(err) != codes.AlreadyExists {
-		gomega.Expect(err).NotTo(gomega.HaveOccurred())
-	}
+		_, err = client.SubscriptionAdminClient.CreateSubscription(ctx, &pubsubpb.Subscription{
+			Name:  p.reqSub,
+			Topic: p.reqTopic,
+		})
+		if err != nil && status.Code(err) != codes.AlreadyExists {
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		}
 
-	_, err = client.SubscriptionAdminClient.CreateSubscription(ctx, &pubsubpb.Subscription{
-		Name:  resSub,
-		Topic: resTopic,
-	})
-	if err != nil && status.Code(err) != codes.AlreadyExists {
-		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		_, err = client.SubscriptionAdminClient.CreateSubscription(ctx, &pubsubpb.Subscription{
+			Name:  p.resSub,
+			Topic: p.resTopic,
+		})
+		if err != nil && status.Code(err) != codes.AlreadyExists {
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		}
 	}
 }
