@@ -249,9 +249,10 @@ func TestSortedSetFlow_ExpiredMessages(t *testing.T) {
 			channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest)},
 			queueName: queue,
 		}},
-		pollInterval: 50 * time.Millisecond,
-		batchSize:    10,
-		gate:         noopGate(),
+		resultChannel: make(chan api.ResultMessage, 1),
+		pollInterval:  50 * time.Millisecond,
+		batchSize:     10,
+		gate:          noopGate(),
 	}
 
 	pastDeadline := time.Now().Unix() - 100
@@ -260,11 +261,24 @@ func TestSortedSetFlow_ExpiredMessages(t *testing.T) {
 
 	go flow.requestWorker(ctx, flow.requestChannels[0].channel.Channel, queue, "")
 
+	// The expiry is surfaced as a DEADLINE_EXCEEDED result rather than a
+	// silent drop, so fetch can distinguish a queue timeout from an unknown id.
+	select {
+	case result := <-flow.resultChannel:
+		if result.ID != "expired" {
+			t.Fatalf("Expected deadline result for %q, got %q", "expired", result.ID)
+		}
+		if result.ErrorCode != api.ErrCodeDeadlineExceeded {
+			t.Fatalf("Expected ErrorCode %q, got %q", api.ErrCodeDeadlineExceeded, result.ErrorCode)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Timeout waiting for deadline exceeded result")
+	}
+
 	select {
 	case msg := <-flow.requestChannels[0].channel.Channel:
 		t.Fatalf("Should not receive expired message: %s", msg.PublicRequest.ReqID())
-	case <-time.After(300 * time.Millisecond):
-		// Expected - message expired
+	default:
 	}
 
 	// Verify message was removed
@@ -288,9 +302,10 @@ func TestSortedSetFlow_ExpiredMessagesCleanupRequestState(t *testing.T) {
 			channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest)},
 			queueName: queue,
 		}},
-		pollInterval: 50 * time.Millisecond,
-		batchSize:    10,
-		gate:         noopGate(),
+		resultChannel: make(chan api.ResultMessage, 1),
+		pollInterval:  50 * time.Millisecond,
+		batchSize:     10,
+		gate:          noopGate(),
 	}
 
 	ir := api.NewInternalRequest(api.InternalRouting{RequestToken: token}, &api.RequestMessage{

@@ -401,8 +401,17 @@ func (r *RedisSortedSetFlow) processMessages(ctx context.Context, msgChannel cha
 		}
 		if deadline < currentTime {
 			logger.V(logutil.DEFAULT).Info("Deadline expired", "id", rview.ReqID())
+			metrics.RecordExceededDeadlineReq(queueID, queueName, poolName)
 			if err := r.cleanupRequestStateByIDAndToken(ctx, rview.ReqID(), ir.RequestToken); err != nil {
 				logger.V(logutil.DEFAULT).Error(err, "Failed to cleanup expired request state", "id", rview.ReqID())
+			}
+			// Surface the expiry instead of dropping silently: without a
+			// result, a fetch cannot distinguish a request that timed out in
+			// the queue from one that never existed.
+			select {
+			case r.resultChannel <- api.NewDeadlineExceededResult(rview, ir.InternalRouting):
+			case <-ctx.Done():
+				return
 			}
 			continue
 		}
