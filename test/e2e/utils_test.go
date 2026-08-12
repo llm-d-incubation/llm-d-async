@@ -10,10 +10,10 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"sync"
 	"time"
 
 	"cloud.google.com/go/pubsub/v2"
+	"cloud.google.com/go/pubsub/v2/apiv1/pubsubpb"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	"github.com/redis/go-redis/v9"
@@ -139,22 +139,21 @@ func popPubSubResult(ctx context.Context, client *pubsub.Client, subName string)
 	sub.ReceiveSettings.MaxOutstandingMessages = 1
 	sub.ReceiveSettings.NumGoroutines = 1
 
-	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	cctx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
 
 	var result *api.ResultMessage
-	var mu sync.Mutex
 	err := sub.Receive(cctx, func(rctx context.Context, msg *pubsub.Message) {
-		mu.Lock()
-		defer mu.Unlock()
 		if result == nil {
 			var r api.ResultMessage
-			if json.Unmarshal(msg.Data, &r) == nil {
+			if err := json.Unmarshal(msg.Data, &r); err != nil {
+				ginkgo.GinkgoLogr.V(1).Info("popPubSubResult unmarshal error", "error", err, "sub", subName)
+			} else {
 				result = &r
-				msg.Ack()
-				cancel()
-				return
 			}
+			msg.Ack()
+			cancel()
+			return
 		}
 		msg.Nack()
 	})
@@ -164,14 +163,15 @@ func popPubSubResult(ctx context.Context, client *pubsub.Client, subName string)
 	return result
 }
 
-func drainPubSubResults(ctx context.Context, client *pubsub.Client, subName string) {
-	dctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	for dctx.Err() == nil {
-		if popPubSubResult(dctx, client, subName) == nil {
-			break
-		}
-	}
+func recreatePubSubSubscription(ctx context.Context, client *pubsub.Client, projectID, subID, topicID string) {
+	subName := fmt.Sprintf("projects/%s/subscriptions/%s", projectID, subID)
+	topicName := fmt.Sprintf("projects/%s/topics/%s", projectID, topicID)
+	_ = client.SubscriptionAdminClient.DeleteSubscription(ctx, &pubsubpb.DeleteSubscriptionRequest{Subscription: subName})
+	_, err := client.SubscriptionAdminClient.CreateSubscription(ctx, &pubsubpb.Subscription{
+		Name:  subName,
+		Topic: topicName,
+	})
+	gomega.ExpectWithOffset(1, err).NotTo(gomega.HaveOccurred())
 }
 
 func makeRequestMessage(id string, deadlineOffset time.Duration) api.RequestMessage {

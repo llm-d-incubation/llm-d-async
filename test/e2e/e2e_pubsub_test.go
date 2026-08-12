@@ -16,7 +16,7 @@ var _ = ginkgo.Describe("GCP PubSub Integration", func() {
 		ctx = context.Background()
 		setSimWaitingRequests(simAdminURL, 0)
 		setEnvoyFaultAbort(envoyAdminURL, 0)
-		drainPubSubResults(ctx, pubsubClient, pubsubResultSub)
+		recreatePubSubSubscription(ctx, pubsubClient, pubsubProjectID, pubsubResultSub, pubsubResultTopic)
 	})
 
 	ginkgo.AfterEach(func() {
@@ -37,7 +37,7 @@ var _ = ginkgo.Describe("GCP PubSub Integration", func() {
 		gomega.Expect(result.ID).To(gomega.Equal("pubsub-e2e-1"))
 	})
 
-	ginkgo.It("collects a batch of messages via GCP PubSub", func() {
+	ginkgo.It("processes multiple messages via GCP PubSub", func() {
 		msg1 := makeRequestMessage("pubsub-batch-1", 5*time.Minute)
 		msg2 := makeRequestMessage("pubsub-batch-2", 5*time.Minute)
 		msg3 := makeRequestMessage("pubsub-batch-3", 5*time.Minute)
@@ -59,6 +59,22 @@ var _ = ginkgo.Describe("GCP PubSub Integration", func() {
 		for _, id := range ids {
 			gomega.Expect(collected).To(gomega.HaveKey(id))
 		}
+	})
+
+	ginkgo.It("preserves caller attributes and metadata via GCP PubSub", func() {
+		msg := makeRequestMessage("pubsub-attr-1", 5*time.Minute)
+		msg.Metadata = map[string]string{
+			"custom-key": "custom-value",
+		}
+		enqueuePubSubMessage(ctx, pubsubClient, pubsubRequestTopic, msg)
+
+		var result *api.ResultMessage
+		gomega.Eventually(func() *api.ResultMessage {
+			result = popPubSubResult(ctx, pubsubClient, pubsubResultSub)
+			return result
+		}, 60*time.Second, 1*time.Second).ShouldNot(gomega.BeNil())
+
+		gomega.Expect(result.ID).To(gomega.Equal("pubsub-attr-1"))
 	})
 
 	ginkgo.It("retries on 5xx from the inference backend via GCP PubSub", func() {

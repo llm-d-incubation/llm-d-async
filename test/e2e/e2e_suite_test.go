@@ -95,6 +95,7 @@ func TestEndToEnd(t *testing.T) {
 var _ = ginkgo.BeforeSuite(func() {
 	setupK8sCluster()
 	gomega.Expect(os.Setenv("KUBECONFIG", kindKubeconfig)).To(gomega.Succeed())
+	gomega.Expect(os.Setenv("PUBSUB_EMULATOR_HOST", "localhost:"+pubsubPort)).To(gomega.Succeed())
 	testConfig = testutils.NewTestConfig(nsName, "")
 	setupK8sClient()
 	setupNameSpace()
@@ -476,7 +477,6 @@ func setupClients() {
 	}, 30*time.Second, 1*time.Second).Should(gomega.Succeed())
 
 	ginkgo.By("Creating PubSub client on localhost:" + pubsubPort)
-	gomega.Expect(os.Setenv("PUBSUB_EMULATOR_HOST", "localhost:"+pubsubPort)).To(gomega.Succeed())
 	var err error
 	pubsubClient, err = pubsub.NewClient(context.Background(), pubsubProjectID)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
@@ -713,7 +713,6 @@ nodes:
 func setupPubSubEmulatorTopicsAndSubscriptions() {
 	ginkgo.By("Setting up PubSub emulator topics and subscriptions")
 	ctx := context.Background()
-	gomega.Expect(os.Setenv("PUBSUB_EMULATOR_HOST", "localhost:"+pubsubPort)).To(gomega.Succeed())
 
 	reqTopic := fmt.Sprintf("projects/%s/topics/%s", pubsubProjectID, pubsubRequestTopic)
 	resTopic := fmt.Sprintf("projects/%s/topics/%s", pubsubProjectID, pubsubResultTopic)

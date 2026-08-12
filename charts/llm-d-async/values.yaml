@@ -53,6 +53,8 @@ ap:
   prometheusCacheTTL: ""
   # Extra environment variables to inject into the processor container.
   # Useful for passing backend-specific configuration like PUBSUB_EMULATOR_HOST.
+  # Note: Avoid setting NAMESPACE or POD_NAME here as it will override the downward
+  # API and break downstream $(NAMESPACE) / $(POD_NAME) OTel resource expansion.
   # env:
   #   - name: PUBSUB_EMULATOR_HOST
   #     value: "pubsub-emulator:8085"
