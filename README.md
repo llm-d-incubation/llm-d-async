@@ -493,7 +493,11 @@ The merge policy is configured using the `--request-merge-policy-config-file` CL
 {
   "type": "tier-priority",
   "parameters": {
-    "priority_header": "x-gateway-priority"
+    "priority_header": "x-gateway-priority",
+    "lane_objectives": {
+      "reserved-interactive": "premium-latency",
+      "overflow-batch": "best-effort"
+    }
   }
 }
 ```
@@ -510,6 +514,8 @@ The merge policy is configured using the `--request-merge-policy-config-file` CL
    - **Parameters**:
      - `priority_header` (optional, string): The HTTP header name used to pass the priority value downstream to the inference scheduler. A name that is not a legal HTTP header name is rejected at startup. Default is `"x-gateway-priority"`.
      - `tier_label` (optional, string): The label name on `InternalRequest.Labels` used to look up the request's priority tier. Default is `"tier"`.
+     - `objective_header` (optional, string): The HTTP header name used to stamp the lane's InferenceObjective name. A name that is not a legal HTTP header name is rejected at startup. Default is `"x-llm-d-inference-objective"` (`api.ObjectiveHeader`).
+     - `lane_objectives` (optional, object): Maps lane keys (`"reserved-interactive"`, `"reserved-async"`, `"reserved-batch"`, `"overflow-interactive"`, `"overflow-async"`, `"overflow-batch"`) to InferenceObjective names. A request whose lane has an entry gets that objective stamped as `objective_header`, which overrides the queue-level `inference_objective`. Lanes without an entry fall back to the queue objective.
      - `fairness_header` / `fairness_attribute` (optional, string): Same as for `random-robin`.
 
 ## Request Body Transforms
