@@ -108,25 +108,31 @@ var _ = ginkgo.Describe("General Integration", func() {
 		gomega.Expect(result.ID).To(gomega.Equal("retry-msg"))
 	})
 
-	ginkgo.It("drops expired messages and processes valid ones", func() {
+	ginkgo.It("surfaces expired messages as deadline exceeded and processes valid ones", func() {
 		expiredMsg := makeRequestMessage("expired-msg", -100*time.Second)
 		validMsg := makeRequestMessage("valid-msg", 5*time.Minute)
 
 		enqueueMessage(ctx, rdb, integrationRequestQueue, expiredMsg)
 		enqueueMessage(ctx, rdb, integrationRequestQueue, validMsg)
 
-		// The expired message is silently dropped at dequeue time (deadline
-		// already in the past). Only the valid message produces a result.
+		// The expired message emits a DEADLINE_EXCEEDED result at dequeue time (deadline
+		// already in the past). The valid message is dispatched and produces a successful result.
 		gomega.Eventually(func() int64 {
 			return getResultCount(ctx, rdb, integrationResultQueue)
-		}, 60*time.Second, 1*time.Second).Should(gomega.BeNumerically(">=", 1))
+		}, 60*time.Second, 1*time.Second).Should(gomega.BeNumerically(">=", 2))
 
-		result := popResult(ctx, rdb, integrationResultQueue)
-		gomega.Expect(result).NotTo(gomega.BeNil())
-		gomega.Expect(result.ID).To(gomega.Equal("valid-msg"))
+		expiredResult := popResult(ctx, rdb, integrationResultQueue)
+		gomega.Expect(expiredResult).NotTo(gomega.BeNil())
+		gomega.Expect(expiredResult.ID).To(gomega.Equal("expired-msg"))
+		gomega.Expect(expiredResult.ErrorCode).To(gomega.Equal(api.ErrCodeDeadlineExceeded))
+		gomega.Expect(expiredResult.ErrorMessage).To(gomega.Equal("deadline exceeded"))
 
-		// Verify the expired message was removed from the request queue
-		// without producing a result.
+		validResult := popResult(ctx, rdb, integrationResultQueue)
+		gomega.Expect(validResult).NotTo(gomega.BeNil())
+		gomega.Expect(validResult.ID).To(gomega.Equal("valid-msg"))
+		gomega.Expect(validResult.ErrorCode).To(gomega.BeEmpty())
+
+		// Verify no other messages remain in the result queue.
 		gomega.Consistently(func() int64 {
 			return getResultCount(ctx, rdb, integrationResultQueue)
 		}, 3*time.Second, 500*time.Millisecond).Should(gomega.Equal(int64(0)))
