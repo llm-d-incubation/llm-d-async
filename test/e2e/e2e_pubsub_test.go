@@ -61,7 +61,7 @@ var _ = ginkgo.Describe("GCP PubSub Integration", func() {
 		}
 	})
 
-	ginkgo.It("preserves caller attributes and metadata via GCP PubSub", func() {
+	ginkgo.It("accepts messages carrying caller attributes via GCP PubSub", func() {
 		msg := makeRequestMessage("pubsub-attr-1", 5*time.Minute)
 		msg.Metadata = map[string]string{
 			"custom-key": "custom-value",

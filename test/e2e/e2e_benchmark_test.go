@@ -119,7 +119,7 @@ var _ = ginkgo.Describe("Async Processor Performance Benchmark E2E", ginkgo.Orde
 		// Wait for the result queue length to match the enqueued requests count
 		gomega.Eventually(func() int64 {
 			return getResultCount(ctx, rdb, benchmarkResultQueue)
-		}, 10*time.Minute, 5*time.Second).Should(gomega.Equal(int64(numRequests)))
+		}, 5*time.Minute, 5*time.Second).Should(gomega.Equal(int64(numRequests)))
 
 		elapsedTime := time.Since(startTime)
 		monitorCancel()
@@ -142,8 +142,9 @@ var _ = ginkgo.Describe("Async Processor Performance Benchmark E2E", ginkgo.Orde
 		ginkgo.GinkgoWriter.Printf("Saturation Metric Points Collected: %v\n", saturationMetrics)
 		ginkgo.GinkgoWriter.Printf("===================================================\n\n")
 
-		// Verify basic correctness: result queue contains all processed messages
+		// Verify basic correctness: result queue contains all processed messages and gate was exercised
 		gomega.Expect(getResultCount(ctx, rdb, benchmarkResultQueue)).To(gomega.Equal(int64(numRequests)))
+		gomega.Expect(saturationMetrics).ToNot(gomega.BeEmpty())
 	})
 
 	ginkgo.It("measure clearing time and saturation under load with pool-level gate", func() {
@@ -204,7 +205,7 @@ var _ = ginkgo.Describe("Async Processor Performance Benchmark E2E", ginkgo.Orde
 		// Wait for the result queue length to match the enqueued requests count
 		gomega.Eventually(func() int64 {
 			return getResultCount(ctx, rdb, benchmarkPoolGateResultQueue)
-		}, 10*time.Minute, 5*time.Second).Should(gomega.Equal(int64(numRequests)))
+		}, 5*time.Minute, 5*time.Second).Should(gomega.Equal(int64(numRequests)))
 
 		elapsedTime := time.Since(startTime)
 		monitorCancel()
@@ -227,8 +228,9 @@ var _ = ginkgo.Describe("Async Processor Performance Benchmark E2E", ginkgo.Orde
 		ginkgo.GinkgoWriter.Printf("Saturation Metric Points Collected: %v\n", saturationMetrics)
 		ginkgo.GinkgoWriter.Printf("====================================================================\n\n")
 
-		// Verify basic correctness: result queue contains all processed messages
+		// Verify basic correctness: result queue contains all processed messages and gate was exercised
 		gomega.Expect(getResultCount(ctx, rdb, benchmarkPoolGateResultQueue)).To(gomega.Equal(int64(numRequests)))
+		gomega.Expect(saturationMetrics).ToNot(gomega.BeEmpty())
 	})
 
 	ginkgo.It("measure clearing time and saturation under load with pub/sub transport and prometheus gate", func() {
@@ -306,7 +308,7 @@ var _ = ginkgo.Describe("Async Processor Performance Benchmark E2E", ginkgo.Orde
 		ginkgo.By("Waiting for all messages to be processed by pub/sub with prometheus gate")
 		gomega.Eventually(func() int64 {
 			return receivedCount.Load()
-		}, 10*time.Minute, 1*time.Second).Should(gomega.Equal(int64(numRequests)))
+		}, 5*time.Minute, 1*time.Second).Should(gomega.Equal(int64(numRequests)))
 
 		elapsedTime := time.Since(startTime)
 		monitorCancel()
@@ -329,8 +331,9 @@ var _ = ginkgo.Describe("Async Processor Performance Benchmark E2E", ginkgo.Orde
 		ginkgo.GinkgoWriter.Printf("Saturation Metric Points Collected: %v\n", saturationMetrics)
 		ginkgo.GinkgoWriter.Printf("===========================================================================\n\n")
 
-		// Verify basic correctness: all messages were processed and received
+		// Verify basic correctness: all messages were processed and received and gate was exercised
 		gomega.Expect(receivedCount.Load()).To(gomega.Equal(int64(numRequests)))
+		gomega.Expect(saturationMetrics).ToNot(gomega.BeEmpty())
 	})
 })
 
