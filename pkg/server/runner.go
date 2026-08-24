@@ -175,6 +175,16 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 	flow.Start(ctx)
 	healthServer.SetReady()
 
+	reconfigurer, dynamicPolicy, watchEnabled, err := validateQueuesConfigWatch(opts, flow, policy)
+	if err != nil {
+		return err
+	}
+	if watchEnabled {
+		startQueuesConfigReload(baseCtx, opts.RedisSortedSet.QueuesConfigFile,
+			opts.RedisSortedSet.QueuesConfigWatchInterval,
+			reconfigurer, dynamicPolicy, poolsMap, setupLog)
+	}
+
 	if reporter, ok := flow.(pipeline.BacklogReporter); ok && opts.Transport.BacklogPollInterval > 0 {
 		go pollBacklog(ctx, reporter, opts.Transport.BacklogPollInterval)
 	} else if !ok {

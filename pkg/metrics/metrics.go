@@ -117,6 +117,14 @@ var (
 		Subsystem: SchedulerSubsystem, Name: "async_pool_worker_limit",
 		Help: "Configured number of concurrent workers (the concurrency limit) for a pool. Compare against async_inflight_requests for worker utilization.",
 	}, []string{LabelPoolName})
+	QueueConfigReloads = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: SchedulerSubsystem, Name: "async_queue_config_reloads_total",
+		Help: "Count of queue-config hot reload attempts, by result (success or error). Errors leave the last good configuration in effect.",
+	}, []string{"result"})
+	QueueConfigLastSuccess = prometheus.NewGauge(prometheus.GaugeOpts{
+		Subsystem: SchedulerSubsystem, Name: "async_queue_config_last_success_timestamp_seconds",
+		Help: "Unix timestamp of the last successfully applied queue-config hot reload.",
+	})
 	GateDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Subsystem: SchedulerSubsystem, Name: "async_gate_decisions_total",
 		Help: "Count of gate decisions that prevented dispatch, by reason (gate_closed, quota_exhausted, dropped, error). quota_exhausted/dropped/error count individual messages refused after they were dequeued; gate_closed counts those plus each dequeue round in which the gate's budget shrank the batch to zero, which is how budget-based gates (prometheus-budget/-saturation/-query) shed work before any message is dequeued.",
@@ -375,6 +383,18 @@ func DecInflight(queueID, queueName, poolName string) {
 	InflightRequests.WithLabelValues(queueID, queueName, poolName).Dec()
 }
 
+// RecordQueueConfigReload counts one queue-config hot reload attempt and,
+// on success, marks the last-applied timestamp so operators can compare
+// desired and actual configuration generations.
+func RecordQueueConfigReload(success bool) {
+	if success {
+		QueueConfigReloads.WithLabelValues("success").Inc()
+		QueueConfigLastSuccess.SetToCurrentTime()
+		return
+	}
+	QueueConfigReloads.WithLabelValues("error").Inc()
+}
+
 // SetBrokerBacklog sets the broker-side backlog for a queue.
 func SetBrokerBacklog(queueID, queueName, poolName string, n float64) {
 	BrokerBacklog.WithLabelValues(queueID, queueName, poolName).Set(n)
@@ -436,7 +456,7 @@ func GetAsyncProcessorCollectors(supportsMessageLatency bool) []prometheus.Colle
 		Retries, AsyncReqs, ExceededDeadlineReqs, FailedReqs, SuccessfulReqs, SheddedRequests, Tokens,
 		QueueDepth, InflightRequests, BrokerBacklog, InferenceLatencyTime, QueueResidenceTime,
 		DeadlineProximity,
-		DispatchBudget, PoolWorkerLimit, GateDecisions,
+		DispatchBudget, PoolWorkerLimit, QueueConfigReloads, QueueConfigLastSuccess, GateDecisions,
 		GateMetricValue, GateMetricThreshold, GateMetricSourceAvailable,
 	}
 	if supportsMessageLatency {

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/spf13/pflag"
 )
@@ -227,17 +228,18 @@ func (o *PubSubFlowOptions) HasQueueConfig() bool {
 
 // SortedSetFlowOptions holds CLI flags for the Redis sorted-set flow.
 type SortedSetFlowOptions struct {
-	IGWBaseURL         string
-	RequestPathURL     string
-	InferenceObjective string
-	RequestQueueName   string
-	ResultQueueName    string
-	QueuesConfig       string
-	QueuesConfigFile   string
-	PollIntervalMs     int
-	BatchSize          int
-	GateType           string
-	GateParamsJSON     string
+	IGWBaseURL                string
+	RequestPathURL            string
+	InferenceObjective        string
+	RequestQueueName          string
+	ResultQueueName           string
+	QueuesConfig              string
+	QueuesConfigFile          string
+	QueuesConfigWatchInterval time.Duration
+	PollIntervalMs            int
+	BatchSize                 int
+	GateType                  string
+	GateParamsJSON            string
 }
 
 func NewSortedSetFlowOptions() *SortedSetFlowOptions {
@@ -259,6 +261,8 @@ func (o *SortedSetFlowOptions) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&o.ResultQueueName, "redis.ss.result-queue-name", o.ResultQueueName, "Result list name")
 	fs.StringVar(&o.QueuesConfig, "redis.ss.queues-config", o.QueuesConfig, "Inline JSON queues configuration")
 	fs.StringVar(&o.QueuesConfigFile, "redis.ss.queues-config-file", o.QueuesConfigFile, "Multiple queues config file")
+	fs.DurationVar(&o.QueuesConfigWatchInterval, "redis.ss.queues-config-watch-interval", 0,
+		"If positive, periodically re-read --redis.ss.queues-config-file and hot reload added/removed/updated queues without restarting. Requires the queues-config-file flag; 0 disables hot reload (default).")
 	fs.IntVar(&o.PollIntervalMs, "redis.ss.poll-interval-ms", o.PollIntervalMs, "Poll interval in milliseconds")
 	fs.IntVar(&o.BatchSize, "redis.ss.batch-size", o.BatchSize, "Number of messages to process per poll")
 	fs.StringVar(&o.GateType, "redis.ss.gate-type", o.GateType, "Gate type for single-queue mode (e.g. redis, prometheus-saturation, prometheus-budget)")
