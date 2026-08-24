@@ -3,8 +3,10 @@ package redis
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"strconv"
 	"sync"
 	"time"
@@ -45,10 +47,42 @@ type requestChannelData struct {
 	gate      pipeline.Gate
 }
 
+// queueRuntime tracks one live queue: its dispatch channel plus the consume
+// worker's lifecycle hooks. cancel stops the worker; done closes after the
+// worker returned, at which point the dispatch channel is safe to close.
+// started marks whether a consume worker has ever been launched, so a queue
+// registered before Start still gets a worker when Start runs.
+type queueRuntime struct {
+	data    requestChannelData
+	config  SortedSetQueueConfig
+	cancel  context.CancelFunc
+	done    chan struct{}
+	started bool
+}
+
+// QueueReconfigureResult describes what one ReconfigureQueues call changed,
+// in the terms the merge policy layer understands: channels that appeared
+// (to be added to the fan-in) and channels that were closed (removed from
+// it; closing the source channel is how a merge policy forgets a queue).
+type QueueReconfigureResult struct {
+	Added   []pipeline.RequestChannel
+	Removed []pipeline.RequestChannel
+}
+
+// SortedSetQueueReconfigurer is the optional capability of a Redis
+// sorted-set flow that supports replacing its queue set at runtime, e.g.
+// after a hot reload of a queues configuration file.
+type SortedSetQueueReconfigurer interface {
+	ReconfigureQueues(queues []SortedSetQueueConfig) (QueueReconfigureResult, error)
+}
+
+var errFlowStopped = errors.New("flow is stopped; cannot reconfigure queues")
+
 var (
 	_ pipeline.Flow                        = (*RedisSortedSetFlow)(nil)
 	_ pipeline.HealthChecker               = (*RedisSortedSetFlow)(nil)
 	_ pipeline.CancellationCheckerProvider = (*RedisSortedSetFlow)(nil)
+	_ SortedSetQueueReconfigurer           = (*RedisSortedSetFlow)(nil)
 )
 
 var cleanupRequestStateScript = redis.NewScript(`
@@ -66,18 +100,32 @@ return 1
 `)
 
 type RedisSortedSetFlow struct {
-	rdb                     *redis.Client
-	cancellationChecker     api.CancellationChecker
-	requestChannels         []requestChannelData
-	retryChannel            chan pipeline.RetryMessage
-	resultChannel           chan api.ResultMessage
-	pollInterval            time.Duration
-	batchSize               int
-	retryQueueName          string
-	activeReleases          sync.Map
-	gate                    pipeline.Gate
-	gateFactory             pipeline.GateFactory
-	configMap               map[string]SortedSetQueueConfig
+	rdb                 *redis.Client
+	cancellationChecker api.CancellationChecker
+	retryChannel        chan pipeline.RetryMessage
+	resultChannel       chan api.ResultMessage
+	pollInterval        time.Duration
+	batchSize           int
+	retryQueueName      string
+	activeReleases      sync.Map
+	gate                pipeline.Gate
+	gateFactory         pipeline.GateFactory
+
+	// queueMu guards the live queue registry: queues, queueOrder,
+	// defaultRequestQueueName and stopped. consumeWg.Add for a queue worker
+	// must happen while holding it, so Wait in StopConsuming can never
+	// undercount a worker started concurrently.
+	queueMu      sync.RWMutex
+	queues       map[string]*queueRuntime
+	queueOrder   []string
+	stopped      bool
+	ctxForQueues context.Context
+
+	// configMap is read on message hot paths (labels, result routing, pool
+	// names); ReconfigureQueues swaps it wholesale under cfgMu.
+	cfgMu     sync.RWMutex
+	configMap map[string]SortedSetQueueConfig
+
 	defaultRequestQueueName string
 	defaultResultQueueName  string
 	workerPools             []pipeline.WorkerPoolConfig
@@ -111,6 +159,102 @@ func (c *redisCancellationChecker) IsCancelled(ctx context.Context, requestID, r
 // (LoadSortedSetConfig does this). workerPools resolves the named pool each
 // queue routes to; gateFactory, when non-nil, instantiates a per-queue gate for
 // any queue that declares a gate_type.
+// normalizeSortedSetQueue fills the Optional fields of a queue config with
+// the same defaults NewRedisSortedSetFlow has always applied: empty worker
+// pool → "default", empty request path → "/v1/completions", and empty ID →
+// the queue name. ReconfigureQueues applies these too so hot-loaded configs
+// behave exactly like startup configs.
+func normalizeSortedSetQueue(cfg *SortedSetQueueConfig) {
+	// Normalize before anything reads it: configMap is the source of the
+	// pool_name label on this queue's metrics, and an unset WorkerPoolID
+	// there would label them "" while the request channel below — and every
+	// pool-keyed series — says "default".
+	if cfg.WorkerPoolID == "" {
+		cfg.WorkerPoolID = "default"
+	}
+	if cfg.RequestPathURL == "" {
+		cfg.RequestPathURL = "/v1/completions"
+	}
+	if cfg.ID == "" {
+		cfg.ID = cfg.QueueName
+	}
+}
+
+// validateSortedSetQueues enforces the cross-entry constraints of a queue
+// set (unique IDs, unique names, every entry dispatchable) before any of
+// them is allowed to change live state.
+func (r *RedisSortedSetFlow) validateSortedSetQueues(queues []SortedSetQueueConfig) error {
+	seenID := make(map[string]bool, len(queues))
+	seenQueue := make(map[string]bool, len(queues))
+	for _, q := range queues {
+		if q.QueueName == "" {
+			return fmt.Errorf("queue_name is required for each queue")
+		}
+		if seenID[q.ID] {
+			return fmt.Errorf("duplicate queue id %q in queue configuration", q.ID)
+		}
+		seenID[q.ID] = true
+		if seenQueue[q.QueueName] {
+			return fmt.Errorf("duplicate queue name %q in queue configuration", q.QueueName)
+		}
+		seenQueue[q.QueueName] = true
+		if q.IGWBaseURL == "" {
+			return fmt.Errorf("queue config for queue %q: igw_base_url must be specified", q.QueueName)
+		}
+		found := false
+		for _, pool := range r.workerPools {
+			if pool.ID == q.WorkerPoolID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("worker pool %q specified in queue config not found in pool configuration", q.WorkerPoolID)
+		}
+	}
+	return nil
+}
+
+// newRequestChannel builds the dispatch channel (and attached gate) for a
+// single already-normalized, already-validated queue config.
+func (r *RedisSortedSetFlow) newRequestChannel(cfg SortedSetQueueConfig) (requestChannelData, error) {
+	workerPoolID := cfg.WorkerPoolID
+
+	var gate pipeline.Gate
+	if r.gateFactory != nil && cfg.GateType != "" {
+		gateCfg := cfg.GateConfig
+		gateCfg.Owner = pipeline.GateOwner{
+			QueueID:      cfg.ID,
+			QueueName:    cfg.QueueName,
+			WorkerPoolID: workerPoolID,
+		}
+		created, err := r.gateFactory.CreateGate(gateCfg)
+		if err != nil {
+			return requestChannelData{}, fmt.Errorf("failed to create gate for queue %q (gate_type=%q): %w", cfg.QueueName, cfg.GateType, err)
+		}
+		gate = created
+	} else if r.gate != nil {
+		gate = r.gate
+	} else {
+		gate = pipeline.ConstOpenGate()
+	}
+
+	ch := pipeline.RequestChannel{
+		Channel:            make(chan *api.InternalRequest),
+		InferenceObjective: cfg.InferenceObjective,
+		RequestPathURL:     cfg.RequestPathURL,
+		IGWBaseURL:         cfg.IGWBaseURL,
+		Gate:               gate,
+		WorkerPoolID:       workerPoolID,
+	}
+	return requestChannelData{
+		channel:   ch,
+		queueName: cfg.QueueName,
+		queueID:   cfg.ID,
+		gate:      gate,
+	}, nil
+}
+
 func NewRedisSortedSetFlow(cfg SortedSetConfig, workerPools []pipeline.WorkerPoolConfig, gateFactory pipeline.GateFactory) (*RedisSortedSetFlow, error) {
 	redisOpts, err := ParseRedisOptions(cfg.URL)
 	if err != nil {
@@ -118,7 +262,8 @@ func NewRedisSortedSetFlow(cfg SortedSetConfig, workerPools []pipeline.WorkerPoo
 	}
 	r := &RedisSortedSetFlow{
 		rdb:                    redis.NewClient(redisOpts),
-		requestChannels:        make([]requestChannelData, 0, len(cfg.Queues)),
+		queues:                 make(map[string]*queueRuntime, len(cfg.Queues)),
+		queueOrder:             make([]string, 0, len(cfg.Queues)),
 		retryChannel:           make(chan pipeline.RetryMessage),
 		resultChannel:          make(chan api.ResultMessage, resultChannelBuffer),
 		pollInterval:           time.Duration(cfg.PollIntervalMs) * time.Millisecond,
@@ -137,79 +282,34 @@ func NewRedisSortedSetFlow(cfg SortedSetConfig, workerPools []pipeline.WorkerPoo
 		}
 	}
 
+	queues := make([]SortedSetQueueConfig, len(cfg.Queues))
+	for i := range queues {
+		queues[i] = cfg.Queues[i]
+		normalizeSortedSetQueue(&queues[i])
+	}
+	if err := r.validateSortedSetQueues(queues); err != nil {
+		_ = r.rdb.Close()
+		return nil, err
+	}
+
 	// Retry messages that lack an explicit RequestQueueName fall back to this
 	// name when re-enqueued (flushRetryBatch). Default to the first configured
 	// queue so retries land on a real key rather than "" — preserving the
 	// previous single-queue fallback behavior.
-	if len(cfg.Queues) > 0 {
-		r.defaultRequestQueueName = cfg.Queues[0].QueueName
+	if len(queues) > 0 {
+		r.defaultRequestQueueName = queues[0].QueueName
 	}
 
-	r.configMap = make(map[string]SortedSetQueueConfig, len(cfg.Queues))
-	for _, cfg := range cfg.Queues {
-		// Normalize before anything reads it: configMap is the source of the
-		// pool_name label on this queue's metrics, and an unset WorkerPoolID
-		// there would label them "" while the request channel below — and every
-		// pool-keyed series — says "default".
-		if cfg.WorkerPoolID == "" {
-			cfg.WorkerPoolID = "default"
+	r.configMap = make(map[string]SortedSetQueueConfig, len(queues))
+	for _, queueCfg := range queues {
+		data, err := r.newRequestChannel(queueCfg)
+		if err != nil {
+			_ = r.rdb.Close()
+			return nil, err
 		}
-		workerPoolID := cfg.WorkerPoolID
-
-		var gate pipeline.Gate
-		if r.gateFactory != nil && cfg.GateType != "" {
-			gateCfg := cfg.GateConfig
-			gateCfg.Owner = pipeline.GateOwner{
-				QueueID:      cfg.ID,
-				QueueName:    cfg.QueueName,
-				WorkerPoolID: workerPoolID,
-			}
-			gate, err = r.gateFactory.CreateGate(gateCfg)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create gate for queue %q (gate_type=%q): %w", cfg.QueueName, cfg.GateType, err)
-			}
-		} else if r.gate != nil {
-			gate = r.gate
-		} else {
-			gate = pipeline.ConstOpenGate()
-		}
-
-		found := false
-		for _, pool := range r.workerPools {
-			if pool.ID == workerPoolID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return nil, fmt.Errorf("worker pool %q specified in queue config not found in pool configuration", workerPoolID)
-		}
-
-		if cfg.IGWBaseURL == "" {
-			return nil, fmt.Errorf("queue config for queue %q: igw_base_url must be specified", cfg.QueueName)
-		}
-
-		reqPath := cfg.RequestPathURL
-		if reqPath == "" {
-			reqPath = "/v1/completions"
-		}
-
-		ch := pipeline.RequestChannel{
-			Channel:            make(chan *api.InternalRequest),
-			InferenceObjective: cfg.InferenceObjective,
-			RequestPathURL:     reqPath,
-			IGWBaseURL:         cfg.IGWBaseURL,
-			Gate:               gate,
-			WorkerPoolID:       workerPoolID,
-		}
-
-		r.configMap[cfg.ID] = cfg
-		r.requestChannels = append(r.requestChannels, requestChannelData{
-			channel:   ch,
-			queueName: cfg.QueueName,
-			queueID:   cfg.ID,
-			gate:      gate,
-		})
+		r.configMap[queueCfg.ID] = queueCfg
+		r.queues[queueCfg.ID] = &queueRuntime{data: data, config: queueCfg, done: make(chan struct{})}
+		r.queueOrder = append(r.queueOrder, queueCfg.ID)
 	}
 
 	if r.gate == nil {
@@ -217,6 +317,26 @@ func NewRedisSortedSetFlow(cfg SortedSetConfig, workerPools []pipeline.WorkerPoo
 	}
 
 	return r, nil
+}
+
+// startQueueWorkerLocked launches the consume worker for a registered
+// queue. Callers hold queueMu, which serializes the consumeWg.Add against
+// Wait in StopConsuming; queues added by a hot reload before StopConsumer
+// is flagged are therefore always waited on.
+func (r *RedisSortedSetFlow) startQueueWorkerLocked(consumeCtx context.Context, entry *queueRuntime) {
+	if entry.started {
+		return
+	}
+	entry.started = true
+	entry.done = make(chan struct{})
+	queueCtx, cancel := context.WithCancel(consumeCtx)
+	entry.cancel = cancel
+	r.consumeWg.Add(1)
+	go func() {
+		defer r.consumeWg.Done()
+		defer close(entry.done)
+		r.requestWorker(queueCtx, entry)
+	}()
 }
 
 func (r *RedisSortedSetFlow) Start(ctx context.Context) {
@@ -227,13 +347,13 @@ func (r *RedisSortedSetFlow) Start(ctx context.Context) {
 	drainCtx, drainCancel := context.WithCancel(log.IntoContext(context.Background(), logger))
 	r.drainCancel = drainCancel
 
-	for _, ch := range r.requestChannels {
-		r.consumeWg.Add(1)
-		go func(ch requestChannelData) {
-			defer r.consumeWg.Done()
-			r.requestWorker(consumeCtx, ch.channel.Channel, ch.queueName, ch.queueID)
-		}(ch)
+	r.queueMu.Lock()
+	r.ctxForQueues = consumeCtx
+	for _, id := range r.queueOrder {
+		r.startQueueWorkerLocked(consumeCtx, r.queues[id])
 	}
+	r.queueMu.Unlock()
+
 	r.consumeWg.Add(1)
 	go func() { defer r.consumeWg.Done(); r.retryMover(consumeCtx) }()
 
@@ -243,10 +363,135 @@ func (r *RedisSortedSetFlow) Start(ctx context.Context) {
 }
 
 func (r *RedisSortedSetFlow) StopConsuming() {
+	// Flag first: any ReconfigureQueues racing the shutdown sees stopped
+	// (under queueMu) before it can start a worker Wait would miss.
+	r.queueMu.Lock()
+	r.stopped = true
+	r.queueMu.Unlock()
+
 	if r.consumeCancel != nil {
 		r.consumeCancel()
 	}
 	r.consumeWg.Wait()
+}
+
+// ReconfigureQueues swaps the live queue set against the registry in one
+// atomic step:
+//
+//   - A queue left unchanged across configs keeps its channel, its gate and
+//     its consume worker untouched.
+//   - A new or modified queue is validated and built before anything live
+//     changes; the fresh channel and worker start inside the registry swap,
+//     so a new queue is consumable the moment the function returns.
+//   - A removed or replaced queue's worker is cancelled; after it exits, the
+//     flow itself closes the queue's channel. Closing the source channel is
+//     how merge policies unregister a queue, keeping the policy's merged
+//     channel (and the inference workers reading it) untouched.
+//
+// Neither Redis backlog of removed queues nor in-flight messages are lost:
+// a worker cancelled mid-send re-enqueues the message into the queue before
+// exiting. Empty queue slices are legal — the flow idles and can still
+// accept queues later. Any validation error leaves the previous, last-good
+// configuration untouched.
+func (r *RedisSortedSetFlow) ReconfigureQueues(queues []SortedSetQueueConfig) (QueueReconfigureResult, error) {
+	normalized := make([]SortedSetQueueConfig, len(queues))
+	for i := range normalized {
+		normalized[i] = queues[i]
+		normalizeSortedSetQueue(&normalized[i])
+	}
+	if err := r.validateSortedSetQueues(normalized); err != nil {
+		return QueueReconfigureResult{}, err
+	}
+
+	// Gate creation and channel allocation may fail or be slow; do all of
+	// it against the new config before touching live state so an error here
+	// cannot leave the registry half-updated.
+	prepared := make(map[string]*queueRuntime, len(normalized))
+	for _, queueCfg := range normalized {
+		data, err := r.newRequestChannel(queueCfg)
+		if err != nil {
+			return QueueReconfigureResult{}, err
+		}
+		prepared[queueCfg.ID] = &queueRuntime{data: data, config: queueCfg}
+	}
+
+	r.queueMu.Lock()
+	if r.stopped {
+		r.queueMu.Unlock()
+		return QueueReconfigureResult{}, errFlowStopped
+	}
+
+	var result QueueReconfigureResult
+	var removed []*queueRuntime
+	newQueues := make(map[string]*queueRuntime, len(normalized))
+	newOrder := make([]string, 0, len(normalized))
+	for _, queueCfg := range normalized {
+		old, exists := r.queues[queueCfg.ID]
+		if exists && reflect.DeepEqual(old.config, queueCfg) {
+			// Unchanged: keep channel, gate and worker exactly as they are.
+			newQueues[queueCfg.ID] = old
+			newOrder = append(newOrder, queueCfg.ID)
+			continue
+		}
+		if exists {
+			// Modified: drain the old incarnation and replace it.
+			if old.cancel != nil {
+				old.cancel()
+			}
+			removed = append(removed, old)
+			result.Removed = append(result.Removed, old.data.channel)
+		}
+		entry := prepared[queueCfg.ID]
+		newQueues[queueCfg.ID] = entry
+		newOrder = append(newOrder, queueCfg.ID)
+		result.Added = append(result.Added, entry.data.channel)
+		if r.ctxForQueues != nil {
+			r.startQueueWorkerLocked(r.ctxForQueues, entry)
+		}
+	}
+	for _, id := range r.queueOrder {
+		if _, kept := newQueues[id]; kept {
+			continue
+		}
+		// Removed outright: drain and unregister.
+		old := r.queues[id]
+		if old.cancel != nil {
+			old.cancel()
+		}
+		removed = append(removed, old)
+		result.Removed = append(result.Removed, old.data.channel)
+	}
+
+	r.queues = newQueues
+	r.queueOrder = newOrder
+	if len(normalized) > 0 {
+		r.defaultRequestQueueName = normalized[0].QueueName
+	}
+	r.queueMu.Unlock()
+
+	newConfigMap := make(map[string]SortedSetQueueConfig, len(normalized))
+	for _, queueCfg := range normalized {
+		newConfigMap[queueCfg.ID] = queueCfg
+	}
+	r.cfgMu.Lock()
+	r.configMap = newConfigMap
+	r.cfgMu.Unlock()
+
+	// Closing a channel whose worker might still send panics, so every
+	// removed worker must have fully returned first. Their cancel was issued
+	// above; a worker blocked pushing to its channel exits via the ctx.Done
+	// branch of the send select and re-enqueues the message into Redis. A
+	// queue removed before Start never had a worker at all: its channel was
+	// also never handed out, so it needs neither wait nor close.
+	for _, old := range removed {
+		if !old.started {
+			continue
+		}
+		<-old.done
+		close(old.data.channel.Channel)
+	}
+
+	return result, nil
 }
 
 func (r *RedisSortedSetFlow) Shutdown() {
@@ -257,9 +502,11 @@ func (r *RedisSortedSetFlow) Shutdown() {
 }
 
 func (r *RedisSortedSetFlow) RequestChannels() []pipeline.RequestChannel {
-	channels := make([]pipeline.RequestChannel, len(r.requestChannels))
-	for i, ch := range r.requestChannels {
-		channels[i] = ch.channel
+	r.queueMu.RLock()
+	defer r.queueMu.RUnlock()
+	channels := make([]pipeline.RequestChannel, 0, len(r.queueOrder))
+	for _, id := range r.queueOrder {
+		channels = append(channels, r.queues[id].data.channel)
 	}
 	return channels
 }
@@ -281,12 +528,25 @@ func zeroExpiringCounts(labels []string) []pipeline.ExpiringCount {
 // deadline. Bucket counts come from ZCOUNT, which compares only scores and
 // never reads member payloads, so the read cost is independent of request
 // size.
+// queueSnapshot copies the registered queues in config order; Redis I/O
+// afterwards must not hold queueMu.
+func (r *RedisSortedSetFlow) queueSnapshot() []requestChannelData {
+	r.queueMu.RLock()
+	defer r.queueMu.RUnlock()
+	out := make([]requestChannelData, 0, len(r.queueOrder))
+	for _, id := range r.queueOrder {
+		out = append(out, r.queues[id].data)
+	}
+	return out
+}
+
 func (r *RedisSortedSetFlow) QueueBacklog(ctx context.Context) ([]pipeline.QueueBacklogStat, error) {
-	stats := make([]pipeline.QueueBacklogStat, 0, len(r.requestChannels))
+	snapshot := r.queueSnapshot()
+	stats := make([]pipeline.QueueBacklogStat, 0, len(snapshot))
 	var firstErr error
 	buckets := metrics.DeadlineProximityBuckets()
 	bucketLabels := metrics.DeadlineProximityBucketLabels()
-	for _, cd := range r.requestChannels {
+	for _, cd := range snapshot {
 		stat := pipeline.QueueBacklogStat{
 			QueueID:   cd.queueID,
 			QueueName: cd.queueName,
@@ -384,39 +644,52 @@ func (r *RedisSortedSetFlow) Characteristics() pipeline.Characteristics {
 }
 
 // Polls sorted set and processes messages by deadline priority (earliest first)
-func (r *RedisSortedSetFlow) requestWorker(ctx context.Context, msgChannel chan *api.InternalRequest, queueName string, queueID string) {
+func (r *RedisSortedSetFlow) requestWorker(ctx context.Context, entry *queueRuntime) {
+	d := entry.data
 	logger := log.FromContext(ctx)
 	ticker := time.NewTicker(r.pollInterval)
 	defer ticker.Stop()
 
-	// Find the gate for this queue
-	var gate pipeline.Gate
-	for _, ch := range r.requestChannels {
-		if ch.queueName == queueName {
-			gate = ch.gate
-			break
-		}
-	}
+	gate := d.gate
 	if gate == nil {
 		gate = r.gate
 	}
 
-	metrics.InitGateDecisions(queueID, queueName, r.poolNameFor(queueID))
+	metrics.InitGateDecisions(d.queueID, d.queueName, r.poolNameFor(d.queueID))
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			r.processMessages(ctx, msgChannel, queueName, queueID, gate, logger)
+			r.processMessages(ctx, d.channel.Channel, d.queueName, d.queueID, gate, logger)
 		}
 	}
+}
+
+// fallbackRequestQueue returns the queue retry messages without an explicit
+// origin queue land on. ReconfigureQueues keeps it pointing at the first
+// configured queue, so it follows hot reloads just like startup defaults.
+func (r *RedisSortedSetFlow) fallbackRequestQueue() string {
+	r.queueMu.RLock()
+	defer r.queueMu.RUnlock()
+	return r.defaultRequestQueueName
+}
+
+// queueConfigOf reads the currently live config of one queue. The map is
+// swapped wholesale by ReconfigureQueues; hot-path readers never see a
+// partially updated config set.
+func (r *RedisSortedSetFlow) queueConfigOf(queueID string) (SortedSetQueueConfig, bool) {
+	r.cfgMu.RLock()
+	defer r.cfgMu.RUnlock()
+	cfg, ok := r.configMap[queueID]
+	return cfg, ok
 }
 
 // poolNameFor returns the worker pool a queue routes to, or "" when the queue has
 // no config entry (the metric label is then empty rather than wrong).
 func (r *RedisSortedSetFlow) poolNameFor(queueID string) string {
-	if cfg, ok := r.configMap[queueID]; ok {
+	if cfg, ok := r.queueConfigOf(queueID); ok {
 		return cfg.WorkerPoolID
 	}
 	return ""
@@ -488,7 +761,7 @@ func (r *RedisSortedSetFlow) processMessages(ctx context.Context, msgChannel cha
 		if ir.QueueID == "" {
 			ir.QueueID = queueID
 		}
-		if cfg, ok := r.configMap[queueID]; ok && len(cfg.Labels) > 0 {
+		if cfg, ok := r.queueConfigOf(queueID); ok && len(cfg.Labels) > 0 {
 			if ir.Labels == nil {
 				ir.Labels = make(map[string]string, len(cfg.Labels))
 			}
@@ -658,7 +931,7 @@ func (r *RedisSortedSetFlow) flushRetryBatch(ctx context.Context, batch []pipeli
 		}
 		queueName := msg.RequestQueueName
 		if queueName == "" {
-			queueName = r.defaultRequestQueueName
+			queueName = r.fallbackRequestQueue()
 		}
 		// Preserve the origin queue in the envelope so the retry mover can
 		// re-enter the message into the right queue once it is due.
@@ -734,7 +1007,7 @@ func (r *RedisSortedSetFlow) flushResultBatch(ctx context.Context, batch []api.R
 	resultTTLs := make(map[string]time.Duration)
 	for _, result := range batch {
 		resultQueue := defaultQueue
-		cfg, hasCfg := r.configMap[result.Routing.QueueID]
+		cfg, hasCfg := r.queueConfigOf(result.Routing.QueueID)
 		if hasCfg && cfg.ResultQueueName != "" {
 			resultQueue = cfg.ResultQueueName
 		} else if result.Routing.ResultQueueName != "" {
@@ -843,7 +1116,7 @@ func (r *RedisSortedSetFlow) retryMover(ctx context.Context) {
 				}
 				queueName := ir.RequestQueueName
 				if queueName == "" {
-					queueName = r.defaultRequestQueueName
+					queueName = r.fallbackRequestQueue()
 				}
 				if err := r.rdb.ZAdd(ctx, queueName, redis.Z{
 					Score:  float64(ir.PublicRequest.ReqDeadline()),

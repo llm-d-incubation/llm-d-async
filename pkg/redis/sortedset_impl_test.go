@@ -55,6 +55,16 @@ func envelopeJSON(rm api.RequestMessage) string {
 	return string(b)
 }
 
+// mkWorkerRuntime wraps a bare channel and queue identity into the runtime
+// shape requestWorker consumes, for tests that drive a worker directly.
+func mkWorkerRuntime(ch chan *api.InternalRequest, queue, queueID string) *queueRuntime {
+	return &queueRuntime{data: requestChannelData{
+		channel:   pipeline.RequestChannel{Channel: ch},
+		queueName: queue,
+		queueID:   queueID,
+	}}
+}
+
 func TestParseSortedSetQueueConfigs(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -148,10 +158,13 @@ func TestSortedSetFlow_MessageProcessing(t *testing.T) {
 	queue := "test-queue"
 	flow := &RedisSortedSetFlow{
 		rdb: rdb,
-		requestChannels: []requestChannelData{{
-			channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest)},
-			queueName: queue,
-		}},
+		queues: map[string]*queueRuntime{
+			"": {data: requestChannelData{
+				channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest)},
+				queueName: queue,
+			}},
+		},
+		queueOrder:   []string{""},
 		pollInterval: 50 * time.Millisecond,
 		batchSize:    10,
 		gate:         noopGate(),
@@ -166,10 +179,10 @@ func TestSortedSetFlow_MessageProcessing(t *testing.T) {
 	}
 	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix()), Member: envelopeJSON(msg)})
 
-	go flow.requestWorker(ctx, flow.requestChannels[0].channel.Channel, queue, "")
+	go flow.requestWorker(ctx, flow.queues[flow.queueOrder[0]])
 
 	select {
-	case received := <-flow.requestChannels[0].channel.Channel:
+	case received := <-flow.queues[flow.queueOrder[0]].data.channel.Channel:
 		if received.PublicRequest == nil || received.PublicRequest.ReqID() != "msg-1" {
 			t.Errorf("Expected msg-1, got %v", received.PublicRequest)
 		}
@@ -216,7 +229,7 @@ func TestSortedSetFlow_DeadlineOrdering(t *testing.T) {
 	}
 
 	msgChannel := make(chan *api.InternalRequest, 10)
-	go flow.requestWorker(ctx, msgChannel, queue, "")
+	go flow.requestWorker(ctx, mkWorkerRuntime(msgChannel, queue, ""))
 
 	var processed []string
 	for i := 0; i < 3; i++ {
@@ -245,10 +258,13 @@ func TestSortedSetFlow_ExpiredMessages(t *testing.T) {
 	queue := "expired-queue"
 	flow := &RedisSortedSetFlow{
 		rdb: rdb,
-		requestChannels: []requestChannelData{{
-			channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest)},
-			queueName: queue,
-		}},
+		queues: map[string]*queueRuntime{
+			"": {data: requestChannelData{
+				channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest)},
+				queueName: queue,
+			}},
+		},
+		queueOrder:    []string{""},
 		resultChannel: make(chan api.ResultMessage, 1),
 		pollInterval:  50 * time.Millisecond,
 		batchSize:     10,
@@ -259,7 +275,7 @@ func TestSortedSetFlow_ExpiredMessages(t *testing.T) {
 	msg := api.RequestMessage{ID: "expired", Created: time.Now().Unix(), Deadline: pastDeadline}
 	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(pastDeadline), Member: envelopeJSON(msg)})
 
-	go flow.requestWorker(ctx, flow.requestChannels[0].channel.Channel, queue, "")
+	go flow.requestWorker(ctx, flow.queues[flow.queueOrder[0]])
 
 	// The expiry is surfaced as a DEADLINE_EXCEEDED result rather than a
 	// silent drop, so fetch can distinguish a queue timeout from an unknown id.
@@ -276,7 +292,7 @@ func TestSortedSetFlow_ExpiredMessages(t *testing.T) {
 	}
 
 	select {
-	case msg := <-flow.requestChannels[0].channel.Channel:
+	case msg := <-flow.queues[flow.queueOrder[0]].data.channel.Channel:
 		t.Fatalf("Should not receive expired message: %s", msg.PublicRequest.ReqID())
 	default:
 	}
@@ -298,10 +314,13 @@ func TestSortedSetFlow_ExpiredMessagesCleanupRequestState(t *testing.T) {
 	requestID := "expired-cleanup"
 	flow := &RedisSortedSetFlow{
 		rdb: rdb,
-		requestChannels: []requestChannelData{{
-			channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest)},
-			queueName: queue,
-		}},
+		queues: map[string]*queueRuntime{
+			"": {data: requestChannelData{
+				channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest)},
+				queueName: queue,
+			}},
+		},
+		queueOrder:    []string{""},
 		resultChannel: make(chan api.ResultMessage, 1),
 		pollInterval:  50 * time.Millisecond,
 		batchSize:     10,
@@ -318,7 +337,7 @@ func TestSortedSetFlow_ExpiredMessagesCleanupRequestState(t *testing.T) {
 	rdb.Set(ctx, api.RequestCancellationKey(requestID), token, time.Hour)
 	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix() - 100), Member: string(msgBytes)})
 
-	go flow.requestWorker(ctx, flow.requestChannels[0].channel.Channel, queue, "")
+	go flow.requestWorker(ctx, flow.queues[flow.queueOrder[0]])
 
 	time.Sleep(300 * time.Millisecond)
 
@@ -342,10 +361,13 @@ func TestSortedSetFlow_CancelledMessageProducesCancelledResult(t *testing.T) {
 	queue := "cancelled-queue"
 	flow := &RedisSortedSetFlow{
 		rdb: rdb,
-		requestChannels: []requestChannelData{{
-			channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest, 1)},
-			queueName: queue,
-		}},
+		queues: map[string]*queueRuntime{
+			"": {data: requestChannelData{
+				channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest, 1)},
+				queueName: queue,
+			}},
+		},
+		queueOrder:    []string{""},
 		resultChannel: make(chan api.ResultMessage, 1),
 		pollInterval:  50 * time.Millisecond,
 		batchSize:     10,
@@ -360,7 +382,7 @@ func TestSortedSetFlow_CancelledMessageProducesCancelledResult(t *testing.T) {
 	rdb.Set(ctx, api.RequestCancellationKey(ir.PublicRequest.ReqID()), requestToken, time.Hour)
 	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix()), Member: string(msgBytes)})
 
-	go flow.requestWorker(ctx, flow.requestChannels[0].channel.Channel, queue, "")
+	go flow.requestWorker(ctx, flow.queues[flow.queueOrder[0]])
 
 	select {
 	case result := <-flow.resultChannel:
@@ -375,7 +397,7 @@ func TestSortedSetFlow_CancelledMessageProducesCancelledResult(t *testing.T) {
 	}
 
 	select {
-	case msg := <-flow.requestChannels[0].channel.Channel:
+	case msg := <-flow.queues[flow.queueOrder[0]].data.channel.Channel:
 		t.Fatalf("Cancelled message should not reach worker channel: %s", msg.PublicRequest.ReqID())
 	default:
 	}
@@ -390,10 +412,13 @@ func TestSortedSetFlow_CancellationCheckErrorLeavesMessageDispatchable(t *testin
 	queue := "cancel-check-error-queue"
 	flow := &RedisSortedSetFlow{
 		rdb: rdb,
-		requestChannels: []requestChannelData{{
-			channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest, 1)},
-			queueName: queue,
-		}},
+		queues: map[string]*queueRuntime{
+			"": {data: requestChannelData{
+				channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest, 1)},
+				queueName: queue,
+			}},
+		},
+		queueOrder:          []string{""},
 		resultChannel:       make(chan api.ResultMessage, 1),
 		pollInterval:        50 * time.Millisecond,
 		batchSize:           10,
@@ -408,10 +433,10 @@ func TestSortedSetFlow_CancellationCheckErrorLeavesMessageDispatchable(t *testin
 	msgBytes, _ := json.Marshal(ir)
 	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix()), Member: string(msgBytes)})
 
-	go flow.requestWorker(ctx, flow.requestChannels[0].channel.Channel, queue, "")
+	go flow.requestWorker(ctx, flow.queues[flow.queueOrder[0]])
 
 	select {
-	case msg := <-flow.requestChannels[0].channel.Channel:
+	case msg := <-flow.queues[flow.queueOrder[0]].data.channel.Channel:
 		if msg.PublicRequest.ReqID() != ir.PublicRequest.ReqID() {
 			t.Fatalf("expected message %q to remain dispatchable, got %q", ir.PublicRequest.ReqID(), msg.PublicRequest.ReqID())
 		}
@@ -431,10 +456,13 @@ func TestSortedSetFlow_MalformedMessages(t *testing.T) {
 	queue := "malformed-queue"
 	flow := &RedisSortedSetFlow{
 		rdb: rdb,
-		requestChannels: []requestChannelData{{
-			channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest)},
-			queueName: queue,
-		}},
+		queues: map[string]*queueRuntime{
+			"": {data: requestChannelData{
+				channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest)},
+				queueName: queue,
+			}},
+		},
+		queueOrder:   []string{""},
 		pollInterval: 50 * time.Millisecond,
 		batchSize:    10,
 		gate:         noopGate(),
@@ -457,11 +485,11 @@ func TestSortedSetFlow_MalformedMessages(t *testing.T) {
 	validMsg := api.RequestMessage{ID: "valid", Created: time.Now().Unix(), Deadline: 9999999999}
 	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix()), Member: envelopeJSON(validMsg)})
 
-	go flow.requestWorker(ctx, flow.requestChannels[0].channel.Channel, queue, "")
+	go flow.requestWorker(ctx, flow.queues[flow.queueOrder[0]])
 
 	// Should skip malformed and receive valid message
 	select {
-	case msg := <-flow.requestChannels[0].channel.Channel:
+	case msg := <-flow.queues[flow.queueOrder[0]].data.channel.Channel:
 		if msg.PublicRequest == nil || msg.PublicRequest.ReqID() != "valid" {
 			t.Errorf("Expected valid message, got %v", msg.PublicRequest)
 		}
@@ -966,7 +994,7 @@ func TestSortedSetFlow_NoRaceCondition(t *testing.T) {
 			defer wg.Done()
 			workerCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
 			defer cancel()
-			go flow.requestWorker(workerCtx, msgChan, queue, "")
+			go flow.requestWorker(workerCtx, mkWorkerRuntime(msgChan, queue, ""))
 			for {
 				select {
 				case msg := <-msgChan:
@@ -1017,7 +1045,7 @@ func TestSortedSetFlow_ContextCancellation(t *testing.T) {
 
 	done := make(chan bool)
 	go func() {
-		flow.requestWorker(workerCtx, msgChan, queue, "")
+		flow.requestWorker(workerCtx, mkWorkerRuntime(msgChan, queue, ""))
 		done <- true
 	}()
 
@@ -1093,10 +1121,13 @@ func TestSortedSetFlow_ZeroBudget(t *testing.T) {
 
 	flow := &RedisSortedSetFlow{
 		rdb: rdb,
-		requestChannels: []requestChannelData{{
-			channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest)},
-			queueName: queue,
-		}},
+		queues: map[string]*queueRuntime{
+			"": {data: requestChannelData{
+				channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest)},
+				queueName: queue,
+			}},
+		},
+		queueOrder:   []string{""},
 		pollInterval: 50 * time.Millisecond,
 		batchSize:    10,
 		gate:         gate,
@@ -1111,11 +1142,11 @@ func TestSortedSetFlow_ZeroBudget(t *testing.T) {
 	}
 	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix()), Member: envelopeJSON(msg)})
 
-	go flow.requestWorker(ctx, flow.requestChannels[0].channel.Channel, queue, "")
+	go flow.requestWorker(ctx, flow.queues[flow.queueOrder[0]])
 
 	// Wait for several poll cycles - message should NOT be pulled (budget=0)
 	select {
-	case <-flow.requestChannels[0].channel.Channel:
+	case <-flow.queues[flow.queueOrder[0]].data.channel.Channel:
 		t.Fatal("Should not receive message when budget is 0")
 	case <-time.After(200 * time.Millisecond):
 		// Expected - no message pulled
@@ -1132,7 +1163,7 @@ func TestSortedSetFlow_ZeroBudget(t *testing.T) {
 
 	// Message should now be pulled
 	select {
-	case received := <-flow.requestChannels[0].channel.Channel:
+	case received := <-flow.queues[flow.queueOrder[0]].data.channel.Channel:
 		if received.PublicRequest == nil || received.PublicRequest.ReqID() != "test-zero-budget" {
 			t.Errorf("Expected test-zero-budget, got %v", received.PublicRequest)
 		}
@@ -1363,10 +1394,13 @@ func TestSortedSetFlow_PartialBudget(t *testing.T) {
 
 	flow := &RedisSortedSetFlow{
 		rdb: rdb,
-		requestChannels: []requestChannelData{{
-			channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest, 20)},
-			queueName: queue,
-		}},
+		queues: map[string]*queueRuntime{
+			"": {data: requestChannelData{
+				channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest, 20)},
+				queueName: queue,
+			}},
+		},
+		queueOrder:   []string{""},
 		pollInterval: 200 * time.Millisecond,
 		batchSize:    10,
 		gate:         gate,
@@ -1382,7 +1416,7 @@ func TestSortedSetFlow_PartialBudget(t *testing.T) {
 		rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix() + int64(i)), Member: envelopeJSON(msg)})
 	}
 
-	go flow.requestWorker(ctx, flow.requestChannels[0].channel.Channel, queue, "")
+	go flow.requestWorker(ctx, flow.queues[flow.queueOrder[0]])
 
 	// Wait for one poll cycle (200ms interval + buffer)
 	time.Sleep(250 * time.Millisecond)
@@ -1409,11 +1443,14 @@ func TestSortedSetFlow_RequestWorkerRequeuesOnShutdown(t *testing.T) {
 
 	flow := &RedisSortedSetFlow{
 		rdb: rdb,
-		requestChannels: []requestChannelData{{
-			channel:   pipeline.RequestChannel{Channel: msgChan},
-			queueName: queue,
-			gate:      noopGate(),
-		}},
+		queues: map[string]*queueRuntime{
+			"": {data: requestChannelData{
+				channel:   pipeline.RequestChannel{Channel: msgChan},
+				queueName: queue,
+				gate:      noopGate(),
+			}},
+		},
+		queueOrder:   []string{""},
 		pollInterval: 50 * time.Millisecond,
 		batchSize:    10,
 		gate:         noopGate(),
@@ -1432,7 +1469,7 @@ func TestSortedSetFlow_RequestWorkerRequeuesOnShutdown(t *testing.T) {
 	workerCtx, workerCancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
-		flow.requestWorker(workerCtx, msgChan, queue, "")
+		flow.requestWorker(workerCtx, mkWorkerRuntime(msgChan, queue, ""))
 		close(done)
 	}()
 
@@ -1559,11 +1596,14 @@ func TestSortedSetFlow_QueueIDSetOnDequeue(t *testing.T) {
 	queueID := "test-qid"
 	flow := &RedisSortedSetFlow{
 		rdb: rdb,
-		requestChannels: []requestChannelData{{
-			channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest)},
-			queueName: queue,
-			queueID:   queueID,
-		}},
+		queues: map[string]*queueRuntime{
+			queueID: {data: requestChannelData{
+				channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest)},
+				queueName: queue,
+				queueID:   queueID,
+			}},
+		},
+		queueOrder:   []string{queueID},
 		pollInterval: 50 * time.Millisecond,
 		batchSize:    10,
 		gate:         noopGate(),
@@ -1572,10 +1612,10 @@ func TestSortedSetFlow_QueueIDSetOnDequeue(t *testing.T) {
 	msg := api.RequestMessage{ID: "msg-qid", Created: time.Now().Unix(), Deadline: 9999999999}
 	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix()), Member: envelopeJSON(msg)})
 
-	go flow.requestWorker(ctx, flow.requestChannels[0].channel.Channel, queue, queueID)
+	go flow.requestWorker(ctx, flow.queues[flow.queueOrder[0]])
 
 	select {
-	case received := <-flow.requestChannels[0].channel.Channel:
+	case received := <-flow.queues[flow.queueOrder[0]].data.channel.Channel:
 		if received.QueueID != queueID {
 			t.Errorf("Expected QueueID %q, got %q", queueID, received.QueueID)
 		}
@@ -1770,7 +1810,7 @@ func TestNewRedisSortedSetFlow_DefaultsWorkerPoolIDInConfigMap(t *testing.T) {
 	if qcfg.WorkerPoolID != "default" {
 		t.Errorf("configMap worker pool = %q, want %q", qcfg.WorkerPoolID, "default")
 	}
-	if got := flow.requestChannels[0].channel.WorkerPoolID; got != qcfg.WorkerPoolID {
+	if got := flow.queues[flow.queueOrder[0]].data.channel.WorkerPoolID; got != qcfg.WorkerPoolID {
 		t.Errorf("request channel worker pool = %q, configMap says %q; the two must agree or the metrics do not join", got, qcfg.WorkerPoolID)
 	}
 }
@@ -1840,10 +1880,11 @@ func TestQueueBacklog(t *testing.T) {
 
 	flow := &RedisSortedSetFlow{
 		rdb: rdb,
-		requestChannels: []requestChannelData{
-			{queueName: "queue-a", queueID: "a"},
-			{queueName: "queue-b", queueID: "b"},
+		queues: map[string]*queueRuntime{
+			"a": {data: requestChannelData{queueName: "queue-a", queueID: "a"}},
+			"b": {data: requestChannelData{queueName: "queue-b", queueID: "b"}},
 		},
+		queueOrder: []string{"a", "b"},
 	}
 
 	// queue-a gets 3 members, queue-b gets 1, an unrelated key is ignored.
@@ -1876,9 +1917,10 @@ func TestQueueBacklogDeadlineViews(t *testing.T) {
 
 	flow := &RedisSortedSetFlow{
 		rdb: rdb,
-		requestChannels: []requestChannelData{
-			{queueName: "queue-a", queueID: "a"},
+		queues: map[string]*queueRuntime{
+			"a": {data: requestChannelData{queueName: "queue-a", queueID: "a"}},
 		},
+		queueOrder: []string{"a"},
 	}
 
 	now := time.Now().Unix()
@@ -1951,9 +1993,10 @@ func TestQueueBacklogDeadlineCountsAtScale(t *testing.T) {
 
 	flow := &RedisSortedSetFlow{
 		rdb: rdb,
-		requestChannels: []requestChannelData{
-			{queueName: "queue-big", queueID: "big"},
+		queues: map[string]*queueRuntime{
+			"big": {data: requestChannelData{queueName: "queue-big", queueID: "big"}},
 		},
+		queueOrder: []string{"big"},
 	}
 
 	now := time.Now().Unix()
@@ -1997,10 +2040,11 @@ func TestQueueBacklogReportsZeroOnError(t *testing.T) {
 
 	flow := &RedisSortedSetFlow{
 		rdb: rdb,
-		requestChannels: []requestChannelData{
-			{queueName: "queue-ok", queueID: "ok"},
-			{queueName: "queue-bad", queueID: "bad"},
+		queues: map[string]*queueRuntime{
+			"ok":  {data: requestChannelData{queueName: "queue-ok", queueID: "ok"}},
+			"bad": {data: requestChannelData{queueName: "queue-bad", queueID: "bad"}},
 		},
+		queueOrder: []string{"ok", "bad"},
 	}
 
 	rdb.ZAdd(ctx, "queue-ok", redis.Z{Score: 0, Member: "m1"})
@@ -2061,11 +2105,14 @@ func TestSortedSetFlow_QueueLabelsSetOnDequeue(t *testing.T) {
 
 	flow := &RedisSortedSetFlow{
 		rdb: rdb,
-		requestChannels: []requestChannelData{{
-			channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest)},
-			queueName: queue,
-			queueID:   queueID,
-		}},
+		queues: map[string]*queueRuntime{
+			queueID: {data: requestChannelData{
+				channel:   pipeline.RequestChannel{Channel: make(chan *api.InternalRequest)},
+				queueName: queue,
+				queueID:   queueID,
+			}},
+		},
+		queueOrder:   []string{queueID},
 		pollInterval: 50 * time.Millisecond,
 		batchSize:    10,
 		gate:         noopGate(),
@@ -2080,10 +2127,10 @@ func TestSortedSetFlow_QueueLabelsSetOnDequeue(t *testing.T) {
 	msg := api.RequestMessage{ID: "msg-labels", Created: time.Now().Unix(), Deadline: 9999999999}
 	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix()), Member: envelopeJSON(msg)})
 
-	go flow.requestWorker(ctx, flow.requestChannels[0].channel.Channel, queue, queueID)
+	go flow.requestWorker(ctx, flow.queues[flow.queueOrder[0]])
 
 	select {
-	case received := <-flow.requestChannels[0].channel.Channel:
+	case received := <-flow.queues[flow.queueOrder[0]].data.channel.Channel:
 		if received.Labels == nil {
 			t.Fatal("Expected labels on dequeued request, got nil")
 		}
