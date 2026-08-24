@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"reflect"
+	"sync"
 
 	"github.com/llm-d/llm-d-async/api"
 	"github.com/llm-d/llm-d-async/pipeline"
@@ -50,15 +51,20 @@ func NewRandomRobinPolicy(name string, cfg Config) *RandomRobinPolicy {
 	return &RandomRobinPolicy{
 		name:     name,
 		fairness: fairness.New(cfg.FairnessHeader, cfg.FairnessAttribute),
+		pools:    make(map[string]*poolFanIn),
 	}
 }
 
 var _ pipeline.RequestMergePolicy = (*RandomRobinPolicy)(nil)
+var _ pipeline.DynamicRequestMergePolicy = (*RandomRobinPolicy)(nil)
 var _ plugins.Plugin = (*RandomRobinPolicy)(nil)
 
 type RandomRobinPolicy struct {
 	name     string
 	fairness fairness.Stamper
+
+	mu    sync.Mutex
+	pools map[string]*poolFanIn
 }
 
 func (r *RandomRobinPolicy) TypedName() plugins.TypedName {
@@ -66,6 +72,142 @@ func (r *RandomRobinPolicy) TypedName() plugins.TypedName {
 		Type: "random-robin",
 		Name: r.name,
 	}
+}
+
+// poolFanIn merges a dynamic set of source channels into a single merged
+// channel. Sources are added via AddRequestChannels and removed by closing
+// the source channel. The merged channel lives for as long as the policy
+// does and is never closed: the number of sources may legitimately drop to
+// zero (e.g. every queue removed by a config reload) and grow again later.
+type poolFanIn struct {
+	merged chan pipeline.EmbelishedRequestMessage
+
+	mu      sync.Mutex
+	sources map[chan *api.InternalRequest]pipeline.RequestChannel
+	// changed is buffered and sent non-blockingly whenever sources changes,
+	// so the fan-in goroutine rebuilds its select cases.
+	changed chan struct{}
+}
+
+func newPoolFanIn(buffer int) *poolFanIn {
+	return &poolFanIn{
+		merged:  make(chan pipeline.EmbelishedRequestMessage, buffer),
+		sources: make(map[chan *api.InternalRequest]pipeline.RequestChannel),
+		changed: make(chan struct{}, 1),
+	}
+}
+
+func (f *poolFanIn) addSource(ch pipeline.RequestChannel) {
+	if _, ok := f.sources[ch.Channel]; !ok {
+		f.sources[ch.Channel] = ch
+		f.notifyChanged()
+	}
+}
+
+func (f *poolFanIn) removeSource(c chan *api.InternalRequest) {
+	if _, ok := f.sources[c]; ok {
+		delete(f.sources, c)
+		f.notifyChanged()
+	}
+}
+
+func (f *poolFanIn) notifyChanged() {
+	select {
+	case f.changed <- struct{}{}:
+	default:
+	}
+}
+
+// snapshot returns the current source set plus a matching case list. Case 0
+// is always the changed-notification channel; source channels follow.
+func (f *poolFanIn) snapshot() ([]pipeline.RequestChannel, []reflect.SelectCase) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	metas := make([]pipeline.RequestChannel, 0, len(f.sources))
+	cases := make([]reflect.SelectCase, 0, len(f.sources)+1)
+	cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(f.changed)})
+	for c, meta := range f.sources {
+		metas = append(metas, meta)
+		cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(c)})
+	}
+	return metas, cases
+}
+
+func (f *poolFanIn) run(stamp func(headers map[string]string, msg pipeline.RequestChannel, ir *api.InternalRequest), workerPoolID string) {
+	for {
+		metas, cases := f.snapshot()
+		if len(metas) == 0 {
+			// No sources: block on the change notification alone.
+			<-f.changed
+			continue
+		}
+		idx, val, ok := reflect.Select(cases)
+		if idx == 0 {
+			// Source set changed; rebuild the cases.
+			continue
+		}
+		if !ok {
+			f.removeSource(metas[idx-1].Channel)
+			continue
+		}
+		ir, ok := val.Interface().(*api.InternalRequest)
+		if !ok || ir == nil {
+			continue
+		}
+		chMeta := metas[idx-1]
+
+		headers := map[string]string{}
+		stamp(headers, chMeta, ir)
+		erm := pipeline.EmbelishedRequestMessage{
+			InternalRequest: ir,
+			HttpHeaders:     headers,
+			RequestURL:      requestURL(chMeta, ir),
+			WorkerPoolID:    workerPoolID,
+		}
+		metrics.IncQueueDepth(ir.QueueID, ir.RequestQueueName, workerPoolID)
+		f.merged <- erm
+	}
+}
+
+// requestURL joins the queue's IGW base URL with the request's effective
+// path: the per-request endpoint wins over the queue default when set.
+func requestURL(chMeta pipeline.RequestChannel, ir *api.InternalRequest) string {
+	requestPath := chMeta.RequestPathURL
+	if ep := ir.PublicRequest.ReqEndpoint(); ep != "" {
+		requestPath = ep
+	}
+	u, _ := url.JoinPath(chMeta.IGWBaseURL, requestPath)
+	return u
+}
+
+func (r *RandomRobinPolicy) stampHeaders(headers map[string]string, chMeta pipeline.RequestChannel, ir *api.InternalRequest) {
+	headers["Content-Type"] = "application/json"
+	if chMeta.InferenceObjective != "" {
+		headers["x-gateway-inference-objective"] = chMeta.InferenceObjective
+	}
+	for k, v := range ir.PublicRequest.ReqHeaders() {
+		headers[k] = v
+	}
+	// Stamped after the caller's headers so the tenant the quota
+	// gate accounts on is the one the gateway arbitrates on.
+	r.fairness.Stamp(headers, ir.PublicRequest)
+}
+
+func (r *RandomRobinPolicy) merge(channels []pipeline.RequestChannel, pools map[string]pipeline.WorkerPoolConfig) error {
+	for _, ch := range channels {
+		workerPoolID := ch.WorkerPoolID
+		if workerPoolID == "" {
+			workerPoolID = "default"
+		}
+		f, ok := r.pools[workerPoolID]
+		if !ok {
+			return fmt.Errorf("worker pool %q not found in pools map", workerPoolID)
+		}
+		f.mu.Lock()
+		f.addSource(ch)
+		f.mu.Unlock()
+	}
+	return nil
 }
 
 func (r *RandomRobinPolicy) MergeRequestChannels(channels []pipeline.RequestChannel, pools map[string]pipeline.WorkerPoolConfig) pipeline.PoolDispatch {
@@ -81,73 +223,43 @@ func (r *RandomRobinPolicy) MergeRequestChannels(channels []pipeline.RequestChan
 		channelsByPool[workerPoolID] = append(channelsByPool[workerPoolID], ch)
 	}
 
+	// A fan-in exists for every configured pool, even those with no source
+	// channels yet, so queue reloads can add sources to any pool and the
+	// merged channel the workers already read never has to be replaced. The
+	// buffer matches the pool's initial source count, preserving the
+	// historical backpressure of a statically configured pool.
+	for workerPoolID := range pools {
+		f := newPoolFanIn(len(channelsByPool[workerPoolID]))
+		r.pools[workerPoolID] = f
+		go f.run(r.stampHeaders, workerPoolID)
+	}
+	if err := r.merge(channels, pools); err != nil {
+		// Unreachable: the pool membership precheck above covers the groups
+		// merge registers. Kept as a hard failure rather than silently
+		// dropping a source channel.
+		panic(err.Error())
+	}
+
 	dispatch := pipeline.PoolDispatch{
 		Channels: make(map[string]chan pipeline.EmbelishedRequestMessage),
 	}
-
-	for workerPoolID, poolChs := range channelsByPool {
-		mergedChannel := make(chan pipeline.EmbelishedRequestMessage, len(poolChs))
-		dispatch.Channels[workerPoolID] = mergedChannel
-
-		if len(poolChs) == 0 {
-			close(mergedChannel)
-			continue
-		}
-
-		cases := make([]reflect.SelectCase, len(poolChs))
-		meta := make([]pipeline.RequestChannel, len(poolChs))
-		for i, ch := range poolChs {
-			cases[i] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ch.Channel)}
-			meta[i] = ch
-		}
-
-		go func(workerPoolID string, cases []reflect.SelectCase, meta []pipeline.RequestChannel, mergedChannel chan pipeline.EmbelishedRequestMessage) {
-			for {
-				i1, val, ok := reflect.Select(cases)
-				if !ok {
-					// one of the channels is closed, remove it
-					cases = append(cases[:i1], cases[i1+1:]...)
-					meta = append(meta[:i1], meta[i1+1:]...)
-					if len(cases) == 0 {
-						close(mergedChannel)
-						break
-					}
-				} else {
-					ir, ok := val.Interface().(*api.InternalRequest)
-					if !ok || ir == nil {
-						continue
-					}
-					chMeta := meta[i1]
-
-					requestPath := chMeta.RequestPathURL
-					if ep := ir.PublicRequest.ReqEndpoint(); ep != "" {
-						requestPath = ep
-					}
-					requestURL, _ := url.JoinPath(chMeta.IGWBaseURL, requestPath)
-					headers := map[string]string{
-						"Content-Type": "application/json",
-					}
-					if chMeta.InferenceObjective != "" {
-						headers["x-gateway-inference-objective"] = chMeta.InferenceObjective
-					}
-					for k, v := range ir.PublicRequest.ReqHeaders() {
-						headers[k] = v
-					}
-					// Stamped after the caller's headers so the tenant the quota
-					// gate accounts on is the one the gateway arbitrates on.
-					r.fairness.Stamp(headers, ir.PublicRequest)
-					erm := pipeline.EmbelishedRequestMessage{
-						InternalRequest: ir,
-						HttpHeaders:     headers,
-						RequestURL:      requestURL,
-						WorkerPoolID:    workerPoolID,
-					}
-					metrics.IncQueueDepth(ir.QueueID, ir.RequestQueueName, workerPoolID)
-					mergedChannel <- erm
-				}
-			}
-		}(workerPoolID, cases, meta, mergedChannel)
+	for workerPoolID, f := range r.pools {
+		dispatch.Channels[workerPoolID] = f.merged
 	}
-
 	return dispatch
+}
+
+func (r *RandomRobinPolicy) AddRequestChannels(channels []pipeline.RequestChannel, pools map[string]pipeline.WorkerPoolConfig) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, ch := range channels {
+		workerPoolID := ch.WorkerPoolID
+		if workerPoolID == "" {
+			workerPoolID = "default"
+		}
+		if _, ok := r.pools[workerPoolID]; !ok {
+			return fmt.Errorf("worker pool %q not found in pools map", workerPoolID)
+		}
+	}
+	return r.merge(channels, pools)
 }

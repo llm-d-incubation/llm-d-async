@@ -107,11 +107,23 @@ func NewTierPriorityPolicy(name string, cfg Config) *TierPriorityPolicy {
 		objectiveHeader: objectiveHeader,
 		laneObjectives:  cfg.LaneObjectives,
 		fairness:        fairness.New(cfg.FairnessHeader, cfg.FairnessAttribute),
+		pools:           make(map[string]*poolMerge),
 	}
 }
 
 var _ pipeline.RequestMergePolicy = (*TierPriorityPolicy)(nil)
+var _ pipeline.DynamicRequestMergePolicy = (*TierPriorityPolicy)(nil)
 var _ plugins.Plugin = (*TierPriorityPolicy)(nil)
+
+// poolMerge holds the per-pool merge state so the fan-in can take on
+// additional source channels after MergeRequestChannels has returned: the
+// merged channel lives for the policy's lifetime, and a closed source
+// channel removes that source's reader from the scheduler.
+type poolMerge struct {
+	scheduler     *scheduler
+	sources       map[chan *api.InternalRequest]struct{}
+	mergedChannel chan pipeline.EmbelishedRequestMessage
+}
 
 type TierPriorityPolicy struct {
 	name            string
@@ -120,6 +132,11 @@ type TierPriorityPolicy struct {
 	objectiveHeader string
 	laneObjectives  map[string]string
 	fairness        fairness.Stamper
+
+	mu sync.Mutex
+	// pools is populated once by MergeRequestChannels (one entry per
+	// configured pool) and then only read by AddRequestChannels.
+	pools map[string]*poolMerge
 }
 
 func (p *TierPriorityPolicy) TypedName() plugins.TypedName {
@@ -268,12 +285,21 @@ func (s *scheduler) Push(ir *api.InternalRequest, chMeta pipeline.RequestChannel
 	return true
 }
 
+func (s *scheduler) AddReader() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.activeReaders++
+}
+
 func (s *scheduler) Pop() (msgAndMeta, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for s.totalBuffered == 0 {
-		if s.activeReaders == 0 || s.closed {
+		// Sources are dynamic: every reader may exit (all source channels
+		// closed) while new sources are added later. Only an explicit Close
+		// ends the pop loop.
+		if s.closed {
 			return msgAndMeta{}, false
 		}
 		s.cond.Wait()
@@ -304,6 +330,57 @@ func (s *scheduler) Close() {
 	s.cond.Broadcast()
 }
 
+// startReader reads one source channel and pushes every message into the
+// pool scheduler, keyed by the channel pointer so messages from the same
+// queue stay strictly round-robined within their lane. The reader exits when
+// the source channel is closed — the standard way a dynamically removed
+// queue leaves the merge.
+func (p *TierPriorityPolicy) startReader(s *scheduler, ch pipeline.RequestChannel) {
+	s.AddReader()
+	go func(ch pipeline.RequestChannel, s *scheduler) {
+		defer s.DecrementReaders()
+		for {
+			val, ok := <-ch.Channel
+			if !ok {
+				break
+			}
+			if val == nil {
+				continue
+			}
+			if !s.Push(val, ch) {
+				break
+			}
+		}
+	}(ch, s)
+}
+
+// addChannels validates the pool reference of every channel before starting
+// any reader, so a bad channel cannot leave the pool set partially extended.
+func (p *TierPriorityPolicy) addChannels(channels []pipeline.RequestChannel, pools map[string]pipeline.WorkerPoolConfig) error {
+	for _, ch := range channels {
+		workerPoolID := ch.WorkerPoolID
+		if workerPoolID == "" {
+			workerPoolID = "default"
+		}
+		if _, ok := p.pools[workerPoolID]; !ok {
+			return fmt.Errorf("worker pool %q not found in pools map", workerPoolID)
+		}
+	}
+	for _, ch := range channels {
+		workerPoolID := ch.WorkerPoolID
+		if workerPoolID == "" {
+			workerPoolID = "default"
+		}
+		pm := p.pools[workerPoolID]
+		if _, already := pm.sources[ch.Channel]; already {
+			continue
+		}
+		pm.sources[ch.Channel] = struct{}{}
+		p.startReader(pm.scheduler, ch)
+	}
+	return nil
+}
+
 func (p *TierPriorityPolicy) MergeRequestChannels(channels []pipeline.RequestChannel, pools map[string]pipeline.WorkerPoolConfig) pipeline.PoolDispatch {
 	channelsByPool := make(map[string][]pipeline.RequestChannel)
 	for _, ch := range channels {
@@ -317,39 +394,28 @@ func (p *TierPriorityPolicy) MergeRequestChannels(channels []pipeline.RequestCha
 		channelsByPool[workerPoolID] = append(channelsByPool[workerPoolID], ch)
 	}
 
-	dispatch := pipeline.PoolDispatch{
-		Channels: make(map[string]chan pipeline.EmbelishedRequestMessage),
+	// A scheduler and merged channel exist for every configured pool, even
+	// those without any source channel yet: queue reloads may add sources to
+	// any pool later, and the merged channel workers already read must never
+	// be replaced.
+	for workerPoolID := range pools {
+		s := newScheduler(1000, 0, p.tierLabel)
+		p.pools[workerPoolID] = &poolMerge{
+			scheduler:     s,
+			sources:       make(map[chan *api.InternalRequest]struct{}),
+			mergedChannel: make(chan pipeline.EmbelishedRequestMessage, len(channelsByPool[workerPoolID])),
+		}
 	}
 
-	for workerPoolID, poolChs := range channelsByPool {
-		mergedChannel := make(chan pipeline.EmbelishedRequestMessage, len(poolChs))
-		dispatch.Channels[workerPoolID] = mergedChannel
+	if err := p.addChannels(channels, pools); err != nil {
+		// Preserve the historical panic: MergeRequestChannels has no error
+		// return, and a misconfigured channel/pool pair is a startup bug.
+		panic(err.Error())
+	}
 
-		if len(poolChs) == 0 {
-			close(mergedChannel)
-			continue
-		}
-
-		s := newScheduler(1000, len(poolChs), p.tierLabel)
-
-		for _, ch := range poolChs {
-			go func(ch pipeline.RequestChannel, s *scheduler) {
-				defer s.DecrementReaders()
-				for {
-					val, ok := <-ch.Channel
-					if !ok {
-						break
-					}
-					if val == nil {
-						continue
-					}
-					if !s.Push(val, ch) {
-						break
-					}
-				}
-			}(ch, s)
-		}
-
+	for workerPoolID, pm := range p.pools {
+		s := pm.scheduler
+		mergedChannel := pm.mergedChannel
 		go func(workerPoolID string, s *scheduler, mergedChannel chan pipeline.EmbelishedRequestMessage, priorityHeader string, tierLabel string, fairnessStamper fairness.Stamper) {
 			defer close(mergedChannel)
 			defer s.Close()
@@ -404,5 +470,17 @@ func (p *TierPriorityPolicy) MergeRequestChannels(channels []pipeline.RequestCha
 		}(workerPoolID, s, mergedChannel, p.priorityHeader, p.tierLabel, p.fairness)
 	}
 
+	dispatch := pipeline.PoolDispatch{
+		Channels: make(map[string]chan pipeline.EmbelishedRequestMessage),
+	}
+	for workerPoolID, pm := range p.pools {
+		dispatch.Channels[workerPoolID] = pm.mergedChannel
+	}
 	return dispatch
+}
+
+func (p *TierPriorityPolicy) AddRequestChannels(channels []pipeline.RequestChannel, pools map[string]pipeline.WorkerPoolConfig) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.addChannels(channels, pools)
 }

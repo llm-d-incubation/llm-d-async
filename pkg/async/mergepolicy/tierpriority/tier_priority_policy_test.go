@@ -344,3 +344,104 @@ func TestTierPriorityStamping(t *testing.T) {
 		}
 	}
 }
+
+func TestAddRequestChannels_NewSourceJoinsScheduler(t *testing.T) {
+	pools := map[string]pipeline.WorkerPoolConfig{
+		"pool-d": {ID: "pool-d", Workers: 1},
+	}
+	ch1 := pipeline.RequestChannel{
+		Channel:      make(chan *api.InternalRequest, 2),
+		WorkerPoolID: "pool-d",
+		IGWBaseURL:   "http://gw",
+	}
+	policy := NewTierPriorityPolicy("test-dynamic", Config{TierLabel: "tier"})
+	dispatch := policy.MergeRequestChannels([]pipeline.RequestChannel{ch1}, pools)
+	merged := dispatch.Channels["pool-d"]
+
+	ch2 := pipeline.RequestChannel{
+		Channel:      make(chan *api.InternalRequest, 2),
+		WorkerPoolID: "pool-d",
+		IGWBaseURL:   "http://gw2",
+	}
+	if err := policy.AddRequestChannels([]pipeline.RequestChannel{ch2}, pools); err != nil {
+		t.Fatalf("AddRequestChannels failed: %v", err)
+	}
+
+	ch1.Channel <- irWithLabels("dyn-1", nil)
+	ch2.Channel <- irWithLabels("dyn-2", nil)
+
+	got := map[string]bool{}
+	deadline := time.After(3 * time.Second)
+	for len(got) < 2 {
+		select {
+		case msg := <-merged:
+			got[msg.PublicRequest.ReqID()] = true
+		case <-deadline:
+			t.Fatalf("timed out, only got %v", got)
+		}
+	}
+	if !got["dyn-1"] || !got["dyn-2"] {
+		t.Fatalf("expected messages from both channels, got %v", got)
+	}
+
+	// Closing the added channel removes exactly its reader; the remaining
+	// source keeps feeding the same merged channel.
+	close(ch2.Channel)
+	deadline = time.After(3 * time.Second)
+	for {
+		select {
+		case msg := <-merged:
+			if msg.PublicRequest.ReqID() == "dyn-3" {
+				return
+			}
+		case ch1.Channel <- irWithLabels("dyn-3", nil):
+		case <-deadline:
+			t.Fatal("merged channel stopped after source closure")
+		}
+	}
+}
+
+func TestAddRequestChannels_UnknownPool(t *testing.T) {
+	pools := map[string]pipeline.WorkerPoolConfig{
+		"pool-d": {ID: "pool-d", Workers: 1},
+	}
+	policy := NewTierPriorityPolicy("test-err", Config{})
+	policy.MergeRequestChannels(nil, pools)
+
+	if err := policy.AddRequestChannels([]pipeline.RequestChannel{
+		{Channel: make(chan *api.InternalRequest), WorkerPoolID: "ghost"},
+	}, pools); err == nil {
+		t.Fatal("expected error for unknown pool")
+	}
+}
+
+func TestAddRequestChannels_Idempotent(t *testing.T) {
+	pools := map[string]pipeline.WorkerPoolConfig{
+		"pool-d": {ID: "pool-d", Workers: 1},
+	}
+	policy := NewTierPriorityPolicy("test-idem", Config{})
+	dispatch := policy.MergeRequestChannels(nil, pools)
+	merged := dispatch.Channels["pool-d"]
+
+	ch := pipeline.RequestChannel{Channel: make(chan *api.InternalRequest, 1), WorkerPoolID: "pool-d", IGWBaseURL: "http://gw"}
+	for range 3 {
+		if err := policy.AddRequestChannels([]pipeline.RequestChannel{ch}, pools); err != nil {
+			t.Fatalf("AddRequestChannels failed: %v", err)
+		}
+	}
+
+	ch.Channel <- irWithLabels("once", nil)
+	select {
+	case msg := <-merged:
+		if msg.PublicRequest.ReqID() != "once" {
+			t.Fatalf("unexpected id %q", msg.PublicRequest.ReqID())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for message")
+	}
+	select {
+	case msg := <-merged:
+		t.Fatalf("duplicate delivery of registered channel: %q", msg.PublicRequest.ReqID())
+	case <-time.After(300 * time.Millisecond):
+	}
+}
