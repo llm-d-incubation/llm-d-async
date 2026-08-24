@@ -31,6 +31,22 @@ type RequestMergePolicy interface {
 	MergeRequestChannels(channels []RequestChannel, pools map[string]WorkerPoolConfig) PoolDispatch
 }
 
+// DynamicRequestMergePolicy is an optional capability of RequestMergePolicy
+// implementations that support taking on additional fan-in source channels at
+// runtime, e.g. after a hot reload of a queue configuration. The per-pool
+// merged channels returned by MergeRequestChannels stay stable for the
+// lifetime of the policy; only the set of source channels feeding each pool
+// changes. A source channel is removed from a pool by closing it: both
+// policies treat a closed source channel as a removal and stop reading it.
+type DynamicRequestMergePolicy interface {
+	RequestMergePolicy
+	// AddRequestChannels registers additional source channels, grouped by
+	// each channel's WorkerPoolID. A channel referencing a pool unknown to
+	// the policy is an error, in which case no channel is added. Adding a
+	// channel already registered is a no-op.
+	AddRequestChannels(channels []RequestChannel, pools map[string]WorkerPoolConfig) error
+}
+
 // ExpiringCount pairs a deadline-proximity bucket with the exact number of
 // queued items whose deadline falls within it. Window is the histogram le
 // bucket label (e.g. "0" for expired items, "60000" for up to 60s away) and
