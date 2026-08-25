@@ -37,15 +37,24 @@ func (s *reconfigStub) callCount() int {
 
 type dynPolicyStub struct {
 	pipeline.RequestMergePolicy
-	mu    sync.Mutex
-	added [][]pipeline.RequestChannel
-	err   error
+	mu       sync.Mutex
+	added    [][]pipeline.RequestChannel
+	err      error
+	failures int
 }
 
 func (s *dynPolicyStub) AddRequestChannels(channels []pipeline.RequestChannel, pools map[string]pipeline.WorkerPoolConfig) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.added = append(s.added, channels)
-	s.mu.Unlock()
+	if s.failures > 0 {
+		s.failures--
+		err := s.err
+		if s.failures == 0 {
+			s.err = nil
+		}
+		return err
+	}
 	return s.err
 }
 
@@ -174,14 +183,37 @@ func TestQueuesConfigReload_FanInFailureRetriesWholeFile(t *testing.T) {
 	flow := &reconfigStub{result: redis.QueueReconfigureResult{
 		Added: []pipeline.RequestChannel{{Channel: make(chan *api.InternalRequest)}},
 	}}
-	policy := &dynPolicyStub{err: errors.New("fan-in broken")}
+	policy := &dynPolicyStub{err: errors.New("fan-in broken"), failures: 1}
 	pools := map[string]pipeline.WorkerPoolConfig{"default": {ID: "default", Workers: 1}}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	startQueuesConfigReload(ctx, path, 10*time.Millisecond, flow, policy, pools, logr.Discard())
 
-	// Policy failure leaves the fingerprint uncommitted, so the same file is
-	// re-submitted on the next tick until the policy accepts it.
-	waitFor(t, "retry loop", func() bool { return flow.callCount() >= 2 })
+	// Policy failure leaves the fingerprint uncommitted and retains the exact
+	// added channel for retry. Once accepted, the flow is idempotently applied
+	// again and the fingerprint is committed.
+	waitFor(t, "fan-in retry", func() bool { return policy.addCount() >= 2 })
+	waitFor(t, "successful reapply", func() bool { return flow.callCount() >= 2 })
+	policy.mu.Lock()
+	defer policy.mu.Unlock()
+	if policy.added[0][0].Channel != policy.added[1][0].Channel {
+		t.Fatal("fan-in retry did not reuse the pending channel")
+	}
+}
+
+func TestQueuesConfigReload_StopsWithContext(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "queues.json")
+	writeQueuesFile(t, path, `[{"id":"q1","queue_name":"q1","igw_base_url":"http://gw"}]`)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startQueuesConfigReload(ctx, path, time.Hour, &reconfigStub{}, &dynPolicyStub{},
+		map[string]pipeline.WorkerPoolConfig{"default": {ID: "default", Workers: 1}}, logr.Discard())
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("reload goroutine did not stop with its context")
+	}
 }

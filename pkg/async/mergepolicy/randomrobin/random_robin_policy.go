@@ -211,6 +211,9 @@ func (r *RandomRobinPolicy) merge(channels []pipeline.RequestChannel, pools map[
 }
 
 func (r *RandomRobinPolicy) MergeRequestChannels(channels []pipeline.RequestChannel, pools map[string]pipeline.WorkerPoolConfig) pipeline.PoolDispatch {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	channelsByPool := make(map[string][]pipeline.RequestChannel)
 	for _, ch := range channels {
 		workerPoolID := ch.WorkerPoolID

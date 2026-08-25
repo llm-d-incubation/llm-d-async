@@ -304,6 +304,12 @@ func (c *deadlineProximityCollector) Set(queueID, queueName, poolName string, cu
 	}
 }
 
+func (c *deadlineProximityCollector) Delete(queueID, queueName, poolName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.series, queueID+"\x00"+queueName+"\x00"+poolName)
+}
+
 // Reset clears every snapshot series.
 func (c *deadlineProximityCollector) Reset() {
 	c.mu.Lock()
@@ -403,6 +409,14 @@ func SetBrokerBacklog(queueID, queueName, poolName string, n float64) {
 // SetDispatchBudget sets the current dispatch budget [0.0-1.0] for a queue's gate.
 func SetDispatchBudget(budget float64, queueID, queueName, poolName string) {
 	DispatchBudget.WithLabelValues(queueID, queueName, poolName).Set(budget)
+}
+
+// RemoveQueueSnapshots deletes point-in-time series for a queue that is no
+// longer configured. Historical counters and latency histograms are retained.
+func RemoveQueueSnapshots(queueID, queueName, poolName string) {
+	BrokerBacklog.DeleteLabelValues(queueID, queueName, poolName)
+	DispatchBudget.DeleteLabelValues(queueID, queueName, poolName)
+	DeadlineProximity.Delete(queueID, queueName, poolName)
 }
 
 // SetPoolWorkerLimit sets the configured worker concurrency limit for a pool.

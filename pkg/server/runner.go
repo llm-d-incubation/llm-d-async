@@ -106,6 +106,10 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	reconfigurer, dynamicPolicy, watchEnabled, err := validateQueuesConfigWatch(opts, flow, policy)
+	if err != nil {
+		return err
+	}
 
 	metrics.Register(metrics.GetAsyncProcessorCollectors(flow.Characteristics().SupportsMessageLatency)...)
 
@@ -175,12 +179,9 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 	flow.Start(ctx)
 	healthServer.SetReady()
 
-	reconfigurer, dynamicPolicy, watchEnabled, err := validateQueuesConfigWatch(opts, flow, policy)
-	if err != nil {
-		return err
-	}
+	var queuesReloadDone <-chan struct{}
 	if watchEnabled {
-		startQueuesConfigReload(baseCtx, opts.RedisSortedSet.QueuesConfigFile,
+		queuesReloadDone = startQueuesConfigReload(ctx, opts.RedisSortedSet.QueuesConfigFile,
 			opts.RedisSortedSet.QueuesConfigWatchInterval,
 			reconfigurer, dynamicPolicy, poolsMap, setupLog)
 	}
@@ -193,6 +194,9 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 
 	<-ctx.Done()
 	healthServer.SetNotReady()
+	if queuesReloadDone != nil {
+		<-queuesReloadDone
+	}
 
 	setupLog.Info("Signal received, stopping message consumption")
 	flow.StopConsuming()
@@ -445,13 +449,19 @@ func pollBacklog(ctx context.Context, reporter pipeline.BacklogReporter, interva
 	logger := ctrl.Log.WithName("backlog-poller")
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	type queueLabels struct {
+		id, name, pool string
+	}
+	previous := make(map[queueLabels]struct{})
 
 	poll := func() {
 		stats, err := reporter.QueueBacklog(ctx)
 		if err != nil {
 			logger.V(logging.DEFAULT).Error(err, "Failed to poll broker backlog")
 		}
+		current := make(map[queueLabels]struct{}, len(stats))
 		for _, s := range stats {
+			current[queueLabels{id: s.QueueID, name: s.QueueName, pool: s.PoolName}] = struct{}{}
 			metrics.SetBrokerBacklog(s.QueueID, s.QueueName, s.PoolName, float64(s.Depth))
 			// Nil counts mean the broker cannot report per-item deadlines
 			// (e.g. Cloud Pub/Sub); emit nothing for it. When present they are
@@ -464,6 +474,14 @@ func pollBacklog(ctx context.Context, reporter pipeline.BacklogReporter, interva
 				}
 				metrics.SetDeadlineProximity(s.QueueID, s.QueueName, s.PoolName, counts)
 			}
+		}
+		if err == nil {
+			for labels := range previous {
+				if _, exists := current[labels]; !exists {
+					metrics.RemoveQueueSnapshots(labels.id, labels.name, labels.pool)
+				}
+			}
+			previous = current
 		}
 	}
 

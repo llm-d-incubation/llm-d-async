@@ -71,6 +71,26 @@ func TestSetDispatchBudget(t *testing.T) {
 	}
 }
 
+func TestRemoveQueueSnapshots(t *testing.T) {
+	BrokerBacklog.Reset()
+	DispatchBudget.Reset()
+	DeadlineProximity.Reset()
+	SetBrokerBacklog("q1", "queue-1", "pool-a", 2)
+	SetDispatchBudget(0.42, "q1", "queue-1", "pool-a")
+	SetDeadlineProximity("q1", "queue-1", "pool-a", make([]int64, len(DeadlineProximityBuckets())))
+
+	RemoveQueueSnapshots("q1", "queue-1", "pool-a")
+	if got := testutil.CollectAndCount(BrokerBacklog); got != 0 {
+		t.Errorf("BrokerBacklog still exposes %d series, want 0", got)
+	}
+	if got := testutil.CollectAndCount(DispatchBudget); got != 0 {
+		t.Errorf("DispatchBudget still exposes %d series, want 0", got)
+	}
+	if got := testutil.CollectAndCount(DeadlineProximity); got != 0 {
+		t.Errorf("DeadlineProximity still exposes %d series, want 0", got)
+	}
+}
+
 func TestSetPoolWorkerLimit(t *testing.T) {
 	SetPoolWorkerLimit("pool-a", 8)
 	got := testutil.ToFloat64(PoolWorkerLimit.WithLabelValues("pool-a"))

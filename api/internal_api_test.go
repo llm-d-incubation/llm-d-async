@@ -7,7 +7,7 @@ import (
 
 func TestRoundTrip_PlainRequestMessage(t *testing.T) {
 	ir := NewInternalRequest(
-		InternalRouting{RetryCount: 2, RequestQueueName: "rq", ResultQueueName: "resq"},
+		InternalRouting{RetryCount: 2, RequestQueueName: "rq", ResultQueueName: "resq", ResultTTLSeconds: 60, ResultRoutingResolved: true},
 		&RequestMessage{
 			ID: "plain-1", Created: 1000, Deadline: 2000,
 			Payload:  map[string]any{"model": "m1"},
@@ -267,6 +267,12 @@ func assertRouting(t *testing.T, got, want InternalRouting) {
 	}
 	if got.ResultQueueName != want.ResultQueueName {
 		t.Errorf("ResultQueueName = %q, want %q", got.ResultQueueName, want.ResultQueueName)
+	}
+	if got.ResultTTLSeconds != want.ResultTTLSeconds {
+		t.Errorf("ResultTTLSeconds = %d, want %d", got.ResultTTLSeconds, want.ResultTTLSeconds)
+	}
+	if got.ResultRoutingResolved != want.ResultRoutingResolved {
+		t.Errorf("ResultRoutingResolved = %v, want %v", got.ResultRoutingResolved, want.ResultRoutingResolved)
 	}
 	if got.TransportCorrelationID != want.TransportCorrelationID {
 		t.Errorf("TransportCorrelationID = %q, want %q", got.TransportCorrelationID, want.TransportCorrelationID)

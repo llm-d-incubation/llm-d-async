@@ -37,6 +37,8 @@ type InternalRouting struct {
 	RequestToken           string `json:"request_token,omitempty"`
 	RequestQueueName       string `json:"request_queue_name,omitempty"`
 	ResultQueueName        string `json:"result_queue_name,omitempty"`
+	ResultTTLSeconds       int64  `json:"result_ttl_seconds,omitempty"`
+	ResultRoutingResolved  bool   `json:"result_routing_resolved,omitempty"`
 	TransportCorrelationID string `json:"transport_correlation_id,omitempty"`
 	// Labels is the framework's per-message label set. Seeded by the
 	// Flow at pull time from the originating channel's effective

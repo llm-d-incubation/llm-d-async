@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/go-logr/logr"
 	"github.com/llm-d/llm-d-async/api"
 	"github.com/llm-d/llm-d-async/pipeline"
 	redislib "github.com/redis/go-redis/v9"
@@ -182,6 +183,42 @@ func TestReconfigureQueues_ModifyReplacesChannel(t *testing.T) {
 
 	pushTestMessage(t, flow, ctx, "q1-queue", "after-modify")
 	awaitMessage(t, result.Added[0].Channel, "after-modify")
+}
+
+func TestReconfigureQueues_InFlightResultKeepsOriginalRouting(t *testing.T) {
+	s := miniredis.RunT(t)
+	original := testQueue("q1")
+	original.ResultQueueName = "results-old"
+	original.ResultTTLSeconds = 60
+	flow := reconfigureTestFlow(t, s, original)
+	defer flow.rdb.Close() // nolint:errcheck
+
+	ctx := context.Background()
+	pushTestMessage(t, flow, ctx, original.QueueName, "in-flight")
+	msgChannel := make(chan *api.InternalRequest, 1)
+	flow.processMessages(ctx, msgChannel, original.QueueName, original.ID, pipeline.ConstOpenGate(), logr.Discard())
+	ir := <-msgChannel
+
+	modified := original
+	modified.ResultQueueName = "results-new"
+	modified.ResultTTLSeconds = 120
+	if _, err := flow.ReconfigureQueues([]SortedSetQueueConfig{modified}); err != nil {
+		t.Fatalf("reconfigure failed: %v", err)
+	}
+
+	flow.flushResultBatch(ctx, []api.ResultMessage{{
+		ID:      ir.PublicRequest.ReqID(),
+		Routing: ir.InternalRouting,
+	}})
+	if n, _ := flow.rdb.LLen(ctx, "results-old").Result(); n != 1 {
+		t.Fatalf("in-flight result was not routed to original queue, got %d", n)
+	}
+	if n, _ := flow.rdb.LLen(ctx, "results-new").Result(); n != 0 {
+		t.Fatalf("in-flight result leaked to new queue, got %d", n)
+	}
+	if ttl := s.TTL("results-old"); ttl <= 0 || ttl > 60*time.Second {
+		t.Fatalf("in-flight result did not keep original TTL, got %v", ttl)
+	}
 }
 
 func TestReconfigureQueues_InvalidConfigKeepsLastGood(t *testing.T) {

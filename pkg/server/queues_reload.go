@@ -32,9 +32,11 @@ func startQueuesConfigReload(
 	policy pipeline.DynamicRequestMergePolicy,
 	pools map[string]pipeline.WorkerPoolConfig,
 	logger logr.Logger,
-) {
+) <-chan struct{} {
 	logger = logger.WithName("queues-config-reload").WithValues("path", path, "interval", interval)
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
@@ -42,8 +44,18 @@ func startQueuesConfigReload(
 		// file even when it matches the startup config — ReconfigureQueues is
 		// idempotent for identical sets, so this only seeds lastApplied.
 		var lastApplied [32]byte
+		var pendingAdded []pipeline.RequestChannel
 
 		reload := func() {
+			if len(pendingAdded) > 0 {
+				if err := policy.AddRequestChannels(pendingAdded, pools); err != nil {
+					metrics.RecordQueueConfigReload(false)
+					logger.Error(err, "Failed to retry merge fan-in extension; retrying next tick", "pending", len(pendingAdded))
+					return
+				}
+				pendingAdded = nil
+			}
+
 			data, err := os.ReadFile(path) // #nosec G304 -- path from trusted CLI flag
 			if err != nil {
 				metrics.RecordQueueConfigReload(false)
@@ -74,7 +86,10 @@ func startQueuesConfigReload(
 					// fan-in update their messages would sit in channels
 					// nobody reads. Retrying the whole file on the next tick
 					// is safe (unchanged queues stay untouched), so the
-					// fingerprint deliberately stays uncommitted.
+					// fingerprint deliberately stays uncommitted. Keep the
+					// exact channels: the next idempotent flow apply will not
+					// report them as Added again.
+					pendingAdded = append([]pipeline.RequestChannel(nil), result.Added...)
 					metrics.RecordQueueConfigReload(false)
 					logger.Error(err, "Failed to extend merge fan-in with new queues; retrying next tick", "added", len(result.Added))
 					return
@@ -96,6 +111,7 @@ func startQueuesConfigReload(
 			}
 		}
 	}()
+	return done
 }
 
 // validateQueuesConfigWatch enforces that hot reload is only requested in a

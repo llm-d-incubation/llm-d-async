@@ -111,20 +111,17 @@ type RedisSortedSetFlow struct {
 	gate                pipeline.Gate
 	gateFactory         pipeline.GateFactory
 
-	// queueMu guards the live queue registry: queues, queueOrder,
-	// defaultRequestQueueName and stopped. consumeWg.Add for a queue worker
-	// must happen while holding it, so Wait in StopConsuming can never
-	// undercount a worker started concurrently.
-	queueMu      sync.RWMutex
-	queues       map[string]*queueRuntime
-	queueOrder   []string
-	stopped      bool
-	ctxForQueues context.Context
-
-	// configMap is read on message hot paths (labels, result routing, pool
-	// names); ReconfigureQueues swaps it wholesale under cfgMu.
-	cfgMu     sync.RWMutex
-	configMap map[string]SortedSetQueueConfig
+	// queueMu guards the complete live queue state: queues, queueOrder,
+	// configMap, defaultRequestQueueName and stopped. consumeWg.Add for a
+	// queue worker must happen while holding it, so Wait in StopConsuming can
+	// never undercount a worker started concurrently.
+	queueMu       sync.RWMutex
+	reconfigureMu sync.Mutex
+	queues        map[string]*queueRuntime
+	queueOrder    []string
+	configMap     map[string]SortedSetQueueConfig
+	stopped       bool
+	ctxForQueues  context.Context
 
 	defaultRequestQueueName string
 	defaultResultQueueName  string
@@ -394,6 +391,9 @@ func (r *RedisSortedSetFlow) StopConsuming() {
 // accept queues later. Any validation error leaves the previous, last-good
 // configuration untouched.
 func (r *RedisSortedSetFlow) ReconfigureQueues(queues []SortedSetQueueConfig) (QueueReconfigureResult, error) {
+	r.reconfigureMu.Lock()
+	defer r.reconfigureMu.Unlock()
+
 	normalized := make([]SortedSetQueueConfig, len(queues))
 	for i := range normalized {
 		normalized[i] = queues[i]
@@ -403,16 +403,38 @@ func (r *RedisSortedSetFlow) ReconfigureQueues(queues []SortedSetQueueConfig) (Q
 		return QueueReconfigureResult{}, err
 	}
 
-	// Gate creation and channel allocation may fail or be slow; do all of
-	// it against the new config before touching live state so an error here
-	// cannot leave the registry half-updated.
+	r.queueMu.Lock()
+	if r.stopped {
+		r.queueMu.Unlock()
+		return QueueReconfigureResult{}, errFlowStopped
+	}
+	r.queueMu.Unlock()
+
+	// Gate creation and channel allocation may fail or be slow. Prepare only
+	// new or changed queues before touching live state; unchanged gates may
+	// own resources and must not be recreated and discarded on every poll.
 	prepared := make(map[string]*queueRuntime, len(normalized))
+	r.queueMu.RLock()
+	currentConfigs := make(map[string]SortedSetQueueConfig, len(r.queues))
+	for id, entry := range r.queues {
+		currentConfigs[id] = entry.config
+	}
+	r.queueMu.RUnlock()
 	for _, queueCfg := range normalized {
+		oldConfig, exists := currentConfigs[queueCfg.ID]
+		if exists && reflect.DeepEqual(oldConfig, queueCfg) {
+			continue
+		}
 		data, err := r.newRequestChannel(queueCfg)
 		if err != nil {
 			return QueueReconfigureResult{}, err
 		}
 		prepared[queueCfg.ID] = &queueRuntime{data: data, config: queueCfg}
+	}
+
+	newConfigMap := make(map[string]SortedSetQueueConfig, len(normalized))
+	for _, queueCfg := range normalized {
+		newConfigMap[queueCfg.ID] = queueCfg
 	}
 
 	r.queueMu.Lock()
@@ -464,18 +486,13 @@ func (r *RedisSortedSetFlow) ReconfigureQueues(queues []SortedSetQueueConfig) (Q
 
 	r.queues = newQueues
 	r.queueOrder = newOrder
+	r.configMap = newConfigMap
 	if len(normalized) > 0 {
 		r.defaultRequestQueueName = normalized[0].QueueName
+	} else {
+		r.defaultRequestQueueName = ""
 	}
 	r.queueMu.Unlock()
-
-	newConfigMap := make(map[string]SortedSetQueueConfig, len(normalized))
-	for _, queueCfg := range normalized {
-		newConfigMap[queueCfg.ID] = queueCfg
-	}
-	r.cfgMu.Lock()
-	r.configMap = newConfigMap
-	r.cfgMu.Unlock()
 
 	// Closing a channel whose worker might still send panics, so every
 	// removed worker must have fully returned first. Their cancel was issued
@@ -484,11 +501,19 @@ func (r *RedisSortedSetFlow) ReconfigureQueues(queues []SortedSetQueueConfig) (Q
 	// queue removed before Start never had a worker at all: its channel was
 	// also never handed out, so it needs neither wait nor close.
 	for _, old := range removed {
+		newCfg, replaced := newConfigMap[old.data.queueID]
+		removeSnapshots := !replaced || newCfg.QueueName != old.data.queueName || newCfg.WorkerPoolID != old.config.WorkerPoolID
 		if !old.started {
+			if removeSnapshots {
+				metrics.RemoveQueueSnapshots(old.data.queueID, old.data.queueName, old.config.WorkerPoolID)
+			}
 			continue
 		}
 		<-old.done
 		close(old.data.channel.Channel)
+		if removeSnapshots {
+			metrics.RemoveQueueSnapshots(old.data.queueID, old.data.queueName, old.config.WorkerPoolID)
+		}
 	}
 
 	return result, nil
@@ -646,6 +671,10 @@ func (r *RedisSortedSetFlow) Characteristics() pipeline.Characteristics {
 // Polls sorted set and processes messages by deadline priority (earliest first)
 func (r *RedisSortedSetFlow) requestWorker(ctx context.Context, entry *queueRuntime) {
 	d := entry.data
+	cfg := entry.config
+	if cfg.ID == "" && cfg.QueueName == "" {
+		cfg, _ = r.queueConfigOf(d.queueID)
+	}
 	logger := log.FromContext(ctx)
 	ticker := time.NewTicker(r.pollInterval)
 	defer ticker.Stop()
@@ -655,14 +684,14 @@ func (r *RedisSortedSetFlow) requestWorker(ctx context.Context, entry *queueRunt
 		gate = r.gate
 	}
 
-	metrics.InitGateDecisions(d.queueID, d.queueName, r.poolNameFor(d.queueID))
+	metrics.InitGateDecisions(d.queueID, d.queueName, cfg.WorkerPoolID)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			r.processMessages(ctx, d.channel.Channel, d.queueName, d.queueID, gate, logger)
+			r.processMessagesWithConfig(ctx, d.channel.Channel, d.queueName, d.queueID, gate, logger, cfg)
 		}
 	}
 }
@@ -676,30 +705,26 @@ func (r *RedisSortedSetFlow) fallbackRequestQueue() string {
 	return r.defaultRequestQueueName
 }
 
-// queueConfigOf reads the currently live config of one queue. The map is
-// swapped wholesale by ReconfigureQueues; hot-path readers never see a
-// partially updated config set.
+// queueConfigOf reads the currently live config of one queue. Queue registry
+// and config map are swapped together, so hot-path readers cannot observe a
+// mixed generation.
 func (r *RedisSortedSetFlow) queueConfigOf(queueID string) (SortedSetQueueConfig, bool) {
-	r.cfgMu.RLock()
-	defer r.cfgMu.RUnlock()
+	r.queueMu.RLock()
+	defer r.queueMu.RUnlock()
 	cfg, ok := r.configMap[queueID]
 	return cfg, ok
 }
 
-// poolNameFor returns the worker pool a queue routes to, or "" when the queue has
-// no config entry (the metric label is then empty rather than wrong).
-func (r *RedisSortedSetFlow) poolNameFor(queueID string) string {
-	if cfg, ok := r.queueConfigOf(queueID); ok {
-		return cfg.WorkerPoolID
-	}
-	return ""
+func (r *RedisSortedSetFlow) processMessages(ctx context.Context, msgChannel chan *api.InternalRequest, queueName string, queueID string, gate pipeline.Gate, logger logr.Logger) {
+	cfg, _ := r.queueConfigOf(queueID)
+	r.processMessagesWithConfig(ctx, msgChannel, queueName, queueID, gate, logger, cfg)
 }
 
-func (r *RedisSortedSetFlow) processMessages(ctx context.Context, msgChannel chan *api.InternalRequest, queueName string, queueID string, gate pipeline.Gate, logger logr.Logger) {
+func (r *RedisSortedSetFlow) processMessagesWithConfig(ctx context.Context, msgChannel chan *api.InternalRequest, queueName string, queueID string, gate pipeline.Gate, logger logr.Logger, cfg SortedSetQueueConfig) {
 	currentTime := float64(time.Now().Unix())
 
 	budget := gate.Budget(ctx)
-	poolName := r.poolNameFor(queueID)
+	poolName := cfg.WorkerPoolID
 	metrics.SetDispatchBudget(budget, queueID, queueName, poolName)
 	batchSize := int(math.Floor(float64(r.batchSize) * budget))
 	if batchSize <= 0 {
@@ -738,6 +763,19 @@ func (r *RedisSortedSetFlow) processMessages(ctx context.Context, msgChannel cha
 		if rview == nil {
 			continue
 		}
+		if ir.RequestQueueName == "" {
+			ir.RequestQueueName = queueName
+		}
+		if ir.QueueID == "" {
+			ir.QueueID = queueID
+		}
+		if !ir.ResultRoutingResolved {
+			if cfg.ResultQueueName != "" {
+				ir.ResultQueueName = cfg.ResultQueueName
+			}
+			ir.ResultTTLSeconds = cfg.ResultTTLSeconds
+			ir.ResultRoutingResolved = true
+		}
 		if deadline < currentTime {
 			logger.V(logutil.DEFAULT).Info("Deadline expired", "id", rview.ReqID())
 			metrics.RecordExceededDeadlineReq(queueID, queueName, poolName)
@@ -755,13 +793,7 @@ func (r *RedisSortedSetFlow) processMessages(ctx context.Context, msgChannel cha
 			continue
 		}
 
-		if ir.RequestQueueName == "" {
-			ir.RequestQueueName = queueName
-		}
-		if ir.QueueID == "" {
-			ir.QueueID = queueID
-		}
-		if cfg, ok := r.queueConfigOf(queueID); ok && len(cfg.Labels) > 0 {
+		if len(cfg.Labels) > 0 {
 			if ir.Labels == nil {
 				ir.Labels = make(map[string]string, len(cfg.Labels))
 			}
@@ -769,7 +801,6 @@ func (r *RedisSortedSetFlow) processMessages(ctx context.Context, msgChannel cha
 				ir.Labels[k] = v
 			}
 		}
-
 		cancelled, err := r.CancellationChecker().IsCancelled(ctx, rview.ReqID(), ir.RequestToken)
 		if err != nil {
 			// Best-effort at dequeue time only. The worker path performs the
@@ -1007,15 +1038,25 @@ func (r *RedisSortedSetFlow) flushResultBatch(ctx context.Context, batch []api.R
 	resultTTLs := make(map[string]time.Duration)
 	for _, result := range batch {
 		resultQueue := defaultQueue
-		cfg, hasCfg := r.queueConfigOf(result.Routing.QueueID)
-		if hasCfg && cfg.ResultQueueName != "" {
-			resultQueue = cfg.ResultQueueName
+		var resultTTL int64
+		if result.Routing.ResultRoutingResolved {
+			if result.Routing.ResultQueueName != "" {
+				resultQueue = result.Routing.ResultQueueName
+			}
+			resultTTL = result.Routing.ResultTTLSeconds
+		} else if cfg, hasCfg := r.queueConfigOf(result.Routing.QueueID); hasCfg {
+			if cfg.ResultQueueName != "" {
+				resultQueue = cfg.ResultQueueName
+			} else if result.Routing.ResultQueueName != "" {
+				resultQueue = result.Routing.ResultQueueName
+			}
+			resultTTL = cfg.ResultTTLSeconds
 		} else if result.Routing.ResultQueueName != "" {
 			resultQueue = result.Routing.ResultQueueName
 		}
 		queued[resultQueue] = append(queued[resultQueue], r.marshalResult(result))
-		if hasCfg && cfg.ResultTTLSeconds > 0 {
-			resultTTLs[resultQueue] = time.Duration(cfg.ResultTTLSeconds) * time.Second
+		if resultTTL > 0 {
+			resultTTLs[resultQueue] = time.Duration(resultTTL) * time.Second
 		}
 	}
 

@@ -12,12 +12,14 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/llm-d/llm-d-async/pipeline"
 	"github.com/llm-d/llm-d-async/pkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
 )
 
@@ -230,12 +232,21 @@ func TestBuildTLSConfig_invalidCertKeyPair(t *testing.T) {
 }
 
 type fakeBacklogReporter struct {
+	mu    sync.Mutex
 	stats []pipeline.QueueBacklogStat
 	err   error
 }
 
 func (f *fakeBacklogReporter) QueueBacklog(context.Context) ([]pipeline.QueueBacklogStat, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.stats, f.err
+}
+
+func (f *fakeBacklogReporter) setStats(stats []pipeline.QueueBacklogStat) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stats = stats
 }
 
 func histogramSampleCount(c prometheus.Collector) uint64 {
@@ -306,6 +317,33 @@ func TestPollBacklogSkipsNilDeadlineViews(t *testing.T) {
 
 	if got := histogramSampleCount(metrics.DeadlineProximity); got != 0 {
 		t.Fatalf("DeadlineProximity sample count = %d, want 0", got)
+	}
+}
+
+func TestPollBacklogRemovesDeletedQueueSnapshots(t *testing.T) {
+	metrics.BrokerBacklog.Reset()
+	metrics.DispatchBudget.Reset()
+	metrics.DeadlineProximity.Reset()
+	labels := pipeline.QueueBacklogStat{QueueID: "gone", QueueName: "queue-gone", PoolName: "pool-a", Depth: 3,
+		ExpiringCounts: make([]pipeline.ExpiringCount, len(metrics.DeadlineProximityBuckets()))}
+	reporter := &fakeBacklogReporter{stats: []pipeline.QueueBacklogStat{labels}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pollBacklog(ctx, reporter, 10*time.Millisecond)
+	waitFor(t, "initial backlog snapshot", func() bool {
+		return testutil.CollectAndCount(metrics.BrokerBacklog) == 1
+	})
+	reporter.setStats(nil)
+	waitFor(t, "deleted backlog snapshot cleanup", func() bool {
+		return testutil.CollectAndCount(metrics.BrokerBacklog) == 0
+	})
+
+	if got := testutil.CollectAndCount(metrics.BrokerBacklog); got != 0 {
+		t.Fatalf("deleted queue backlog still exposes %d series", got)
+	}
+	if got := testutil.CollectAndCount(metrics.DeadlineProximity); got != 0 {
+		t.Fatalf("deleted queue deadline snapshot still exposes %d series", got)
 	}
 }
 

@@ -335,10 +335,15 @@ func (s *scheduler) Close() {
 // queue stay strictly round-robined within their lane. The reader exits when
 // the source channel is closed — the standard way a dynamically removed
 // queue leaves the merge.
-func (p *TierPriorityPolicy) startReader(s *scheduler, ch pipeline.RequestChannel) {
-	s.AddReader()
-	go func(ch pipeline.RequestChannel, s *scheduler) {
-		defer s.DecrementReaders()
+func (p *TierPriorityPolicy) startReader(pm *poolMerge, ch pipeline.RequestChannel) {
+	pm.scheduler.AddReader()
+	go func() {
+		defer func() {
+			pm.scheduler.DecrementReaders()
+			p.mu.Lock()
+			delete(pm.sources, ch.Channel)
+			p.mu.Unlock()
+		}()
 		for {
 			val, ok := <-ch.Channel
 			if !ok {
@@ -347,11 +352,11 @@ func (p *TierPriorityPolicy) startReader(s *scheduler, ch pipeline.RequestChanne
 			if val == nil {
 				continue
 			}
-			if !s.Push(val, ch) {
+			if !pm.scheduler.Push(val, ch) {
 				break
 			}
 		}
-	}(ch, s)
+	}()
 }
 
 // addChannels validates the pool reference of every channel before starting
@@ -376,12 +381,15 @@ func (p *TierPriorityPolicy) addChannels(channels []pipeline.RequestChannel, poo
 			continue
 		}
 		pm.sources[ch.Channel] = struct{}{}
-		p.startReader(pm.scheduler, ch)
+		p.startReader(pm, ch)
 	}
 	return nil
 }
 
 func (p *TierPriorityPolicy) MergeRequestChannels(channels []pipeline.RequestChannel, pools map[string]pipeline.WorkerPoolConfig) pipeline.PoolDispatch {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	channelsByPool := make(map[string][]pipeline.RequestChannel)
 	for _, ch := range channels {
 		workerPoolID := ch.WorkerPoolID
