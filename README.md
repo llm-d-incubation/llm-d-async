@@ -193,8 +193,6 @@ make deploy-ap-on-k8s
        kubectl run --rm -i -t publishmsgbox --image=redis --restart=Never -- /usr/local/bin/redis-cli -h $REDIS_IP PUBLISH request-queue '{"id" : "testmsg", "payload":{ "model":"food-review-1", "prompt":"Hi, good morning "}, "deadline" :23472348233323 }'
      ```
 
-## Configuration Reference
-
 ### Command Line Parameters
 
 **Core:**
@@ -205,6 +203,7 @@ make deploy-ap-on-k8s
 | `transport` | `redis-pubsub` | The transport (message queue) implementation. One of `redis-pubsub`, `redis-sortedset`, `gcp-pubsub`. Gating is configured per queue/topic via `gate_type` in the transport config (this replaces the former `gcp-pubsub-gated` implementation). |
 | `transport-config` | — | Inline JSON transport configuration. See [Transport Configuration](#transport-configuration). Mutually exclusive with `transport-config-file`; exactly one of the two is required. |
 | `transport-config-file` | — | Path to a JSON file with the transport configuration. Mutually exclusive with `transport-config`. |
+| `transport-config-watch-interval` | `0` | For `redis-sortedset` only, periodically reloads the `queues` field from `transport-config-file`. The file must contain a complete valid transport configuration. Changes to other transport fields require a restart. |
 | `pool-config-file` | — | Path to the JSON worker pool definitions. If omitted, a single `"default"` worker pool is created with concurrency determined by the global `concurrency` flag. See [Worker Pools Configuration](#worker-pools-configuration). |
 | `request-merge-policy-config-file` | — | Path to the JSON request merge policy specification (`type` and `parameters`). If not specified, defaults to the `random-robin` policy. The older `--request-merge-policy-config` name is a deprecated alias. |
 | `transform-config-file` | — | Path to the JSON request body transform configuration. Empty disables transforms. See [Request Body Transform Reference](#request-body-transform-reference). |
@@ -276,6 +275,8 @@ The transport (message queue) is selected with `--transport` and configured with
   "queues": [ { "queue_name": "request-sortedset", "igw_base_url": "http://localhost:30800", "gate_type": "redis", "gate_params": { "address": "localhost:6379" } } ]
 }
 ```
+
+Queue hot reload is enabled with `--transport redis-sortedset --transport-config-file FILE --transport-config-watch-interval INTERVAL`. Only `queues` may change; URL, retry/result queue names, polling, batch, tracing, and any other transport fields are rejected until restart. An empty `queues` array drains all queues, and queues may be added again by a later reload. Inline `--transport-config` and deprecated per-backend queue configuration do not support hot reload.
 
 **`gcp-pubsub`:**
 ```json

@@ -39,6 +39,7 @@ type TransportOptions struct {
 	Type                  string
 	Config                string
 	ConfigFile            string
+	ConfigWatchInterval   time.Duration
 	MergePolicyConfigFile string
 	BacklogPollInterval   time.Duration
 }
@@ -138,6 +139,7 @@ func (o *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&o.Transport.Type, "transport", o.Transport.Type, "The transport implementation to use. Supported: redis-pubsub, redis-sortedset, gcp-pubsub")
 	fs.StringVar(&o.Transport.Config, "transport-config", o.Transport.Config, "Inline JSON transport configuration. Mutually exclusive with --transport-config-file.")
 	fs.StringVar(&o.Transport.ConfigFile, "transport-config-file", o.Transport.ConfigFile, "Path to transport configuration JSON file. Mutually exclusive with --transport-config.")
+	fs.DurationVar(&o.Transport.ConfigWatchInterval, "transport-config-watch-interval", o.Transport.ConfigWatchInterval, "If positive, periodically reload the queues field of --transport-config-file; 0 disables hot reload (default)")
 	fs.StringVar(&o.Transport.MergePolicyConfigFile, "request-merge-policy-config-file", o.Transport.MergePolicyConfigFile, "Path to the request merge policy configuration JSON file (empty defaults to random-robin)")
 	// Deprecated: use --request-merge-policy-config-file. Retained for backwards compatibility.
 	fs.StringVar(&o.legacyMergePolicyConfigFile, "request-merge-policy-config", o.legacyMergePolicyConfigFile, "Deprecated: use --request-merge-policy-config-file. Path to the request merge policy configuration JSON file")
@@ -226,6 +228,17 @@ var (
 )
 
 func (o *Options) Validate() error {
+	if o.Transport.ConfigWatchInterval < 0 {
+		return fmt.Errorf("--transport-config-watch-interval must not be negative")
+	}
+	if o.Transport.ConfigWatchInterval > 0 {
+		if !o.usingNewTransport() || o.Transport.Type != "redis-sortedset" {
+			return fmt.Errorf("--transport-config-watch-interval requires --transport redis-sortedset")
+		}
+		if o.Transport.Config != "" || o.Transport.ConfigFile == "" {
+			return fmt.Errorf("--transport-config-watch-interval requires --transport-config-file and cannot be used with --transport-config")
+		}
+	}
 	if o.usingNewTransport() {
 		if err := o.validateNewTransport(); err != nil {
 			return err

@@ -2,6 +2,8 @@ package randomrobin
 
 import (
 	"fmt"
+	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -464,5 +466,56 @@ func TestAddRequestChannels_Idempotent(t *testing.T) {
 	case msg := <-mergedChannel:
 		t.Fatalf("duplicate delivery of registered channel: %q", msg.PublicRequest.ReqID())
 	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+func TestAddRequestChannelsConcurrentWithSourceClose(t *testing.T) {
+	pools := map[string]pipeline.WorkerPoolConfig{"default": {ID: "default", Workers: 1}}
+	policy := NewRandomRobinPolicy("test", Config{})
+	initial := pipeline.RequestChannel{Channel: make(chan *api.InternalRequest), WorkerPoolID: "default"}
+	dispatch := policy.MergeRequestChannels([]pipeline.RequestChannel{initial}, pools)
+	merged := dispatch.Channels["default"]
+	added := pipeline.RequestChannel{Channel: make(chan *api.InternalRequest, 1), WorkerPoolID: "default", IGWBaseURL: "http://added"}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		close(initial.Channel)
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		if err := policy.AddRequestChannels([]pipeline.RequestChannel{added}, pools); err != nil {
+			t.Errorf("AddRequestChannels failed: %v", err)
+		}
+	}()
+	close(start)
+	wg.Wait()
+	fanIn := policy.pools["default"]
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		fanIn.mu.Lock()
+		_, initialExists := fanIn.sources[initial.Channel]
+		_, addedExists := fanIn.sources[added.Channel]
+		fanIn.mu.Unlock()
+		if !initialExists && addedExists {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fan-in did not remove the closed source and retain the added source")
+		}
+		runtime.Gosched()
+	}
+
+	added.Channel <- irID("after-concurrent-close")
+	select {
+	case msg := <-merged:
+		if msg.PublicRequest.ReqID() != "after-concurrent-close" {
+			t.Fatalf("unexpected message %q", msg.PublicRequest.ReqID())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("new source was not available after concurrent close")
 	}
 }

@@ -71,9 +71,11 @@ type QueueReconfigureResult struct {
 
 // SortedSetQueueReconfigurer is the optional capability of a Redis
 // sorted-set flow that supports replacing its queue set at runtime, e.g.
-// after a hot reload of a queues configuration file.
+// after a hot reload of a queues configuration file. beforeCommit receives
+// every new or replacement channel after preparation but before live state is
+// changed. If it returns an error, the old registry and workers are untouched.
 type SortedSetQueueReconfigurer interface {
-	ReconfigureQueues(queues []SortedSetQueueConfig) (QueueReconfigureResult, error)
+	ReconfigureQueues(queues []SortedSetQueueConfig, beforeCommit func([]pipeline.RequestChannel) error) (QueueReconfigureResult, error)
 }
 
 var errFlowStopped = errors.New("flow is stopped; cannot reconfigure queues")
@@ -389,8 +391,10 @@ func (r *RedisSortedSetFlow) StopConsuming() {
 // a worker cancelled mid-send re-enqueues the message into the queue before
 // exiting. Empty queue slices are legal — the flow idles and can still
 // accept queues later. Any validation error leaves the previous, last-good
-// configuration untouched.
-func (r *RedisSortedSetFlow) ReconfigureQueues(queues []SortedSetQueueConfig) (QueueReconfigureResult, error) {
+// configuration untouched. beforeCommit runs after all preparation and the
+// final stopped check, but before any live state changes. Once it succeeds,
+// the remaining commit path cannot fail.
+func (r *RedisSortedSetFlow) ReconfigureQueues(queues []SortedSetQueueConfig, beforeCommit func([]pipeline.RequestChannel) error) (QueueReconfigureResult, error) {
 	r.reconfigureMu.Lock()
 	defer r.reconfigureMu.Unlock()
 
@@ -456,10 +460,8 @@ func (r *RedisSortedSetFlow) ReconfigureQueues(queues []SortedSetQueueConfig) (Q
 			continue
 		}
 		if exists {
-			// Modified: drain the old incarnation and replace it.
-			if old.cancel != nil {
-				old.cancel()
-			}
+			// Modified: drain the old incarnation and replace it after the
+			// commit callback succeeds.
 			removed = append(removed, old)
 			result.Removed = append(result.Removed, old.data.channel)
 		}
@@ -467,9 +469,6 @@ func (r *RedisSortedSetFlow) ReconfigureQueues(queues []SortedSetQueueConfig) (Q
 		newQueues[queueCfg.ID] = entry
 		newOrder = append(newOrder, queueCfg.ID)
 		result.Added = append(result.Added, entry.data.channel)
-		if r.ctxForQueues != nil {
-			r.startQueueWorkerLocked(r.ctxForQueues, entry)
-		}
 	}
 	for _, id := range r.queueOrder {
 		if _, kept := newQueues[id]; kept {
@@ -477,11 +476,28 @@ func (r *RedisSortedSetFlow) ReconfigureQueues(queues []SortedSetQueueConfig) (Q
 		}
 		// Removed outright: drain and unregister.
 		old := r.queues[id]
+		removed = append(removed, old)
+		result.Removed = append(result.Removed, old.data.channel)
+	}
+	if beforeCommit != nil && len(result.Added) > 0 {
+		if err := beforeCommit(result.Added); err != nil {
+			r.queueMu.Unlock()
+			return QueueReconfigureResult{}, err
+		}
+	}
+	for _, old := range removed {
 		if old.cancel != nil {
 			old.cancel()
 		}
-		removed = append(removed, old)
-		result.Removed = append(result.Removed, old.data.channel)
+	}
+	for _, queueCfg := range normalized {
+		old, exists := r.queues[queueCfg.ID]
+		if exists && reflect.DeepEqual(old.config, queueCfg) {
+			continue
+		}
+		if r.ctxForQueues != nil {
+			r.startQueueWorkerLocked(r.ctxForQueues, newQueues[queueCfg.ID])
+		}
 	}
 
 	r.queues = newQueues

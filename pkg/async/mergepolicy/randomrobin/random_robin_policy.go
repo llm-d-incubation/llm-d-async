@@ -98,6 +98,8 @@ func newPoolFanIn(buffer int) *poolFanIn {
 }
 
 func (f *poolFanIn) addSource(ch pipeline.RequestChannel) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if _, ok := f.sources[ch.Channel]; !ok {
 		f.sources[ch.Channel] = ch
 		f.notifyChanged()
@@ -105,6 +107,8 @@ func (f *poolFanIn) addSource(ch pipeline.RequestChannel) {
 }
 
 func (f *poolFanIn) removeSource(c chan *api.InternalRequest) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if _, ok := f.sources[c]; ok {
 		delete(f.sources, c)
 		f.notifyChanged()
@@ -203,9 +207,7 @@ func (r *RandomRobinPolicy) merge(channels []pipeline.RequestChannel, pools map[
 		if !ok {
 			return fmt.Errorf("worker pool %q not found in pools map", workerPoolID)
 		}
-		f.mu.Lock()
 		f.addSource(ch)
-		f.mu.Unlock()
 	}
 	return nil
 }

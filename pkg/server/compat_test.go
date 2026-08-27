@@ -146,6 +146,49 @@ func TestResolveTransport_PrefersNewFlags(t *testing.T) {
 	}
 }
 
+func TestValidateTransportConfigWatchCombinations(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "canonical file sorted set",
+			args: []string{"--transport=redis-sortedset", "--transport-config-file=/tmp/transport.json", "--transport-config-watch-interval=1s"},
+		},
+		{
+			name: "inline config rejected",
+			args: []string{"--transport=redis-sortedset", `--transport-config={"url":"redis://x","queues":[{"queue_name":"q","igw_base_url":"http://gw"}]}`, "--transport-config-watch-interval=1s"},
+			want: "--transport-config-file",
+		},
+		{
+			name: "other transport rejected",
+			args: []string{"--transport=redis-pubsub", "--transport-config-file=/tmp/transport.json", "--transport-config-watch-interval=1s"},
+			want: "redis-sortedset",
+		},
+		{
+			name: "legacy transport rejected",
+			args: []string{"--message-queue-impl=redis-sortedset", "--transport-config-watch-interval=1s"},
+			want: "redis-sortedset",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			o := newTestOptions(t, tt.args...)
+			err := o.Validate()
+			if tt.want == "" {
+				if err != nil {
+					t.Fatalf("Validate() failed: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Validate() error = %v, want substring %q", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestResolveTransport_NormalizesGatedAlias(t *testing.T) {
 	o := newTestOptions(t,
 		"--message-queue-impl=gcp-pubsub-gated",

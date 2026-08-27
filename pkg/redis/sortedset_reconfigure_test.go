@@ -78,7 +78,7 @@ func TestReconfigureQueues_AddNewQueueStartsConsuming(t *testing.T) {
 	defer flow.StopConsuming()
 	defer flow.Shutdown()
 
-	result, err := flow.ReconfigureQueues([]SortedSetQueueConfig{testQueue("q1"), testQueue("q2")})
+	result, err := flow.ReconfigureQueues([]SortedSetQueueConfig{testQueue("q1"), testQueue("q2")}, nil)
 	if err != nil {
 		t.Fatalf("reconfigure failed: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestReconfigureQueues_RemoveStopsConsumingAndCloses(t *testing.T) {
 	defer flow.Shutdown()
 
 	q1Channel := flow.queues["q1"].data.channel.Channel
-	result, err := flow.ReconfigureQueues([]SortedSetQueueConfig{testQueue("q2")})
+	result, err := flow.ReconfigureQueues([]SortedSetQueueConfig{testQueue("q2")}, nil)
 	if err != nil {
 		t.Fatalf("reconfigure failed: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestReconfigureQueues_RemoveStopsConsumingAndCloses(t *testing.T) {
 
 	// Re-adding the same ID must produce a fresh channel that consumes the
 	// preserved backlog.
-	result2, err := flow.ReconfigureQueues([]SortedSetQueueConfig{testQueue("q1"), testQueue("q2")})
+	result2, err := flow.ReconfigureQueues([]SortedSetQueueConfig{testQueue("q1"), testQueue("q2")}, nil)
 	if err != nil {
 		t.Fatalf("re-add failed: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestReconfigureQueues_ModifyReplacesChannel(t *testing.T) {
 	modified := testQueue("q1")
 	modified.InferenceObjective = "new-objective"
 
-	result, err := flow.ReconfigureQueues([]SortedSetQueueConfig{modified})
+	result, err := flow.ReconfigureQueues([]SortedSetQueueConfig{modified}, nil)
 	if err != nil {
 		t.Fatalf("reconfigure failed: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestReconfigureQueues_InFlightResultKeepsOriginalRouting(t *testing.T) {
 	modified := original
 	modified.ResultQueueName = "results-new"
 	modified.ResultTTLSeconds = 120
-	if _, err := flow.ReconfigureQueues([]SortedSetQueueConfig{modified}); err != nil {
+	if _, err := flow.ReconfigureQueues([]SortedSetQueueConfig{modified}, nil); err != nil {
 		t.Fatalf("reconfigure failed: %v", err)
 	}
 
@@ -247,7 +247,7 @@ func TestReconfigureQueues_InvalidConfigKeepsLastGood(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := flow.ReconfigureQueues(tc.queues); err == nil {
+			if _, err := flow.ReconfigureQueues(tc.queues, nil); err == nil {
 				t.Fatal("expected validation error")
 			}
 			// The live queue set must be untouched.
@@ -265,6 +265,100 @@ func TestReconfigureQueues_InvalidConfigKeepsLastGood(t *testing.T) {
 	awaitMessage(t, flow.RequestChannels()[0].Channel, "last-good")
 }
 
+func TestReconfigureQueues_CallbackErrorKeepsLiveRegistry(t *testing.T) {
+	s := miniredis.RunT(t)
+	flow := reconfigureTestFlow(t, s, testQueue("q1"))
+	flow.Start(context.Background())
+	defer flow.StopConsuming()
+	defer flow.Shutdown()
+
+	old := flow.RequestChannels()[0]
+	wantErr := errors.New("policy unavailable")
+	result, err := flow.ReconfigureQueues([]SortedSetQueueConfig{testQueue("q1"), testQueue("q2")}, func(added []pipeline.RequestChannel) error {
+		if len(added) != 1 || added[0].WorkerPoolID != "default" || added[0].IGWBaseURL != "http://gw" {
+			t.Fatalf("callback saw wrong added channels: %+v", added)
+		}
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want %v", err, wantErr)
+	}
+	if len(result.Added) != 0 || len(result.Removed) != 0 {
+		t.Fatalf("failed callback returned result: %+v", result)
+	}
+	channels := flow.RequestChannels()
+	if len(channels) != 1 || channels[0].Channel != old.Channel {
+		t.Fatalf("live registry changed after callback failure: %+v", channels)
+	}
+	pushTestMessage(t, flow, context.Background(), "q1-queue", "still-live")
+	awaitMessage(t, old.Channel, "still-live")
+}
+
+func TestReconfigureQueues_CallbackSeesAddedBeforeCommit(t *testing.T) {
+	s := miniredis.RunT(t)
+	flow := reconfigureTestFlow(t, s, testQueue("q1"))
+	flow.Start(context.Background())
+	defer flow.StopConsuming()
+	defer flow.Shutdown()
+
+	callbackCalled := false
+	result, err := flow.ReconfigureQueues([]SortedSetQueueConfig{testQueue("q1"), testQueue("q2")}, func(added []pipeline.RequestChannel) error {
+		callbackCalled = true
+		if len(added) != 1 || added[0].WorkerPoolID != "default" {
+			t.Fatalf("callback saw wrong added channels: %+v", added)
+		}
+		return nil
+	})
+	if err != nil || !callbackCalled {
+		t.Fatalf("reconfigure callback result: called=%v err=%v", callbackCalled, err)
+	}
+	if len(result.Added) != 1 || len(flow.RequestChannels()) != 2 {
+		t.Fatalf("successful callback did not commit: result=%+v channels=%d", result, len(flow.RequestChannels()))
+	}
+}
+
+func TestReconfigureQueues_WaitingWorkerIsReleasedByStopConsuming(t *testing.T) {
+	s := miniredis.RunT(t)
+	flow := reconfigureTestFlow(t, s, testQueue("q1"))
+	flow.Start(context.Background())
+	defer flow.Shutdown()
+
+	old := flow.queues["q1"]
+	cancelCalled := make(chan struct{})
+	old.cancel = func() {
+		close(cancelCalled)
+	}
+	reconfigureDone := make(chan error, 1)
+	go func() {
+		_, err := flow.ReconfigureQueues(nil, nil)
+		reconfigureDone <- err
+	}()
+	select {
+	case <-cancelCalled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("reconfigure did not begin draining the removed worker")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		flow.StopConsuming()
+		close(stopDone)
+	}()
+	select {
+	case err := <-reconfigureDone:
+		if err != nil {
+			t.Fatalf("reconfigure failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("reconfigure remained blocked after StopConsuming")
+	}
+	select {
+	case <-stopDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("StopConsuming did not return")
+	}
+}
+
 func TestReconfigureQueues_IdenticalConfigIsNoop(t *testing.T) {
 	s := miniredis.RunT(t)
 	flow := reconfigureTestFlow(t, s, testQueue("q1"))
@@ -274,7 +368,7 @@ func TestReconfigureQueues_IdenticalConfigIsNoop(t *testing.T) {
 	defer flow.StopConsuming()
 	defer flow.Shutdown()
 
-	result, err := flow.ReconfigureQueues([]SortedSetQueueConfig{testQueue("q1")})
+	result, err := flow.ReconfigureQueues([]SortedSetQueueConfig{testQueue("q1")}, nil)
 	if err != nil {
 		t.Fatalf("reconfigure failed: %v", err)
 	}
@@ -292,7 +386,7 @@ func TestReconfigureQueues_EmptyConfigDrainsAll(t *testing.T) {
 	defer flow.StopConsuming()
 	defer flow.Shutdown()
 
-	result, err := flow.ReconfigureQueues(nil)
+	result, err := flow.ReconfigureQueues(nil, nil)
 	if err != nil {
 		t.Fatalf("reconfigure failed: %v", err)
 	}
@@ -304,7 +398,7 @@ func TestReconfigureQueues_EmptyConfigDrainsAll(t *testing.T) {
 	}
 
 	// Empty is not a dead end: queues can still come back.
-	result2, err := flow.ReconfigureQueues([]SortedSetQueueConfig{testQueue("q1")})
+	result2, err := flow.ReconfigureQueues([]SortedSetQueueConfig{testQueue("q1")}, nil)
 	if err != nil || len(result2.Added) != 1 {
 		t.Fatalf("re-add after drain failed: added=%d err=%v", len(result2.Added), err)
 	}
@@ -321,7 +415,7 @@ func TestReconfigureQueues_AfterStopConsumingFails(t *testing.T) {
 	flow.StopConsuming()
 	defer flow.Shutdown()
 
-	if _, err := flow.ReconfigureQueues([]SortedSetQueueConfig{testQueue("q2")}); !errors.Is(err, errFlowStopped) {
+	if _, err := flow.ReconfigureQueues([]SortedSetQueueConfig{testQueue("q2")}, nil); !errors.Is(err, errFlowStopped) {
 		t.Fatalf("expected errFlowStopped, got %v", err)
 	}
 }
@@ -343,7 +437,7 @@ func TestReconfigureQueues_RaceWithStopConsuming(t *testing.T) {
 			// Either succeeds before stop or fails with errFlowStopped —
 			// both are legal; the run must not panic, deadlock or race.
 			go func() {
-				_, _ = flow.ReconfigureQueues([]SortedSetQueueConfig{testQueue("q1")})
+				_, _ = flow.ReconfigureQueues([]SortedSetQueueConfig{testQueue("q1")}, nil)
 			}()
 			<-stopDone
 			flow.Shutdown()

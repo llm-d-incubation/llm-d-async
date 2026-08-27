@@ -102,7 +102,7 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 		return err
 	}
 
-	flow, err := loadFlow(opts, gateFactory, poolsMap)
+	flow, sortedSetConfig, err := loadFlow(opts, gateFactory, poolsMap)
 	if err != nil {
 		return err
 	}
@@ -181,8 +181,8 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 
 	var queuesReloadDone <-chan struct{}
 	if watchEnabled {
-		queuesReloadDone = startQueuesConfigReload(ctx, opts.RedisSortedSet.QueuesConfigFile,
-			opts.RedisSortedSet.QueuesConfigWatchInterval,
+		queuesReloadDone = startQueuesConfigReload(ctx, opts.Transport.ConfigFile,
+			opts.Transport.ConfigWatchInterval, sortedSetConfig,
 			reconfigurer, dynamicPolicy, poolsMap, setupLog)
 	}
 
@@ -194,12 +194,11 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 
 	<-ctx.Done()
 	healthServer.SetNotReady()
+	setupLog.Info("Signal received, stopping message consumption")
+	flow.StopConsuming()
 	if queuesReloadDone != nil {
 		<-queuesReloadDone
 	}
-
-	setupLog.Info("Signal received, stopping message consumption")
-	flow.StopConsuming()
 
 	setupLog.Info("Draining in-flight requests", "timeout", opts.Worker.DrainTimeout)
 	done := make(chan struct{})
@@ -288,7 +287,7 @@ func loadRequestMergePolicy(configPath string, ctx context.Context) (pipeline.Re
 	return policy, nil
 }
 
-func loadFlow(opts *Options, gateFactory *flowcontrol.GateFactory, poolsMap map[string]pipeline.WorkerPoolConfig) (pipeline.Flow, error) {
+func loadFlow(opts *Options, gateFactory *flowcontrol.GateFactory, poolsMap map[string]pipeline.WorkerPoolConfig) (pipeline.Flow, *redis.SortedSetConfig, error) {
 	workerPools := make([]pipeline.WorkerPoolConfig, 0, len(poolsMap))
 	for _, p := range poolsMap {
 		workerPools = append(workerPools, p)
@@ -296,35 +295,39 @@ func loadFlow(opts *Options, gateFactory *flowcontrol.GateFactory, poolsMap map[
 
 	transportType, configBytes, err := opts.resolveTransport()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	switch transportType {
 	case "redis-pubsub":
 		cfg, err := redis.LoadPubSubConfig(configBytes)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return redis.NewRedisMQFlow(*cfg, workerPools)
+		flow, err := redis.NewRedisMQFlow(*cfg, workerPools)
+		return flow, nil, err
 	case "redis-sortedset":
 		cfg, err := redis.LoadSortedSetConfig(configBytes)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return redis.NewRedisSortedSetFlow(*cfg, workerPools, gateFactory)
+		flow, err := redis.NewRedisSortedSetFlow(*cfg, workerPools, gateFactory)
+		return flow, cfg, err
 	case "gcp-pubsub":
 		cfg, err := pubsub.LoadConfig(configBytes)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		// The legacy plain gcp-pubsub alias never gated (see legacyUngatedPubSub);
 		// pass a nil factory so a gate_type in a legacy topics file stays inert.
 		if opts.legacyUngatedPubSub() {
-			return pubsub.NewGCPPubSubMQFlow(*cfg, workerPools, nil)
+			flow, err := pubsub.NewGCPPubSubMQFlow(*cfg, workerPools, nil)
+			return flow, nil, err
 		}
-		return pubsub.NewGCPPubSubMQFlow(*cfg, workerPools, gateFactory)
+		flow, err := pubsub.NewGCPPubSubMQFlow(*cfg, workerPools, gateFactory)
+		return flow, nil, err
 	default:
-		return nil, fmt.Errorf("unknown transport: %s", transportType)
+		return nil, nil, fmt.Errorf("unknown transport: %s", transportType)
 	}
 }
 
