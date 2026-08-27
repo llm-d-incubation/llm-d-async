@@ -63,12 +63,16 @@ var (
 
 	containerRuntime = detectContainerRuntime()
 	apImage          = env.GetEnvString("AP_IMAGE", "ghcr.io/llm-d/llm-d-async:e2e-test", ginkgo.GinkgoLogr)
-	eppImage         = env.GetEnvString("EPP_IMAGE", "registry.k8s.io/gateway-api-inference-extension/epp:v1.5.0", ginkgo.GinkgoLogr)
-	simImage         = env.GetEnvString("SIM_IMAGE", "ghcr.io/llm-d/llm-d-inference-sim:v0.10.0", ginkgo.GinkgoLogr)
-	redisImage       = env.GetEnvString("REDIS_IMAGE", "valkey/valkey:8-alpine", ginkgo.GinkgoLogr)
-	pubsubImage      = env.GetEnvString("PUBSUB_IMAGE", "gcr.io/google.com/cloudsdktool/google-cloud-cli:513.0.0-emulators", ginkgo.GinkgoLogr)
-	gaieRoot         = os.Getenv("GAIE_ROOT")
-	simRoot          = os.Getenv("SIM_ROOT")
+	eppImage         = env.GetEnvString("EPP_IMAGE", "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0", ginkgo.GinkgoLogr)
+	// gaieVersion selects the gateway-api-inference-extension release whose
+	// CRDs are fetched; decoupled from the EPP image tag because the image now
+	// comes from llm-d-router, which pins its own gaie version in go.mod.
+	gaieVersion = env.GetEnvString("GAIE_VERSION", "v1.5.0", ginkgo.GinkgoLogr)
+	simImage    = env.GetEnvString("SIM_IMAGE", "ghcr.io/llm-d/llm-d-inference-sim:v0.10.0", ginkgo.GinkgoLogr)
+	redisImage  = env.GetEnvString("REDIS_IMAGE", "valkey/valkey:8-alpine", ginkgo.GinkgoLogr)
+	pubsubImage = env.GetEnvString("PUBSUB_IMAGE", "gcr.io/google.com/cloudsdktool/google-cloud-cli:513.0.0-emulators", ginkgo.GinkgoLogr)
+	gaieRoot    = os.Getenv("GAIE_ROOT")
+	simRoot     = os.Getenv("SIM_ROOT")
 
 	testConfig *testutils.TestConfig
 
@@ -524,7 +528,7 @@ var gaieInferencePoolCRDs = []string{
 
 // inferencePoolCRDs returns paths to the CRD files.
 // When GAIE_ROOT is set, CRDs are read from the local checkout;
-// otherwise they are fetched from the GAIE GitHub release matching the EPP_IMAGE tag.
+// otherwise they are fetched from the GAIE GitHub release at GAIE_VERSION.
 func inferencePoolCRDs() []string {
 	if gaieRoot != "" {
 		base := filepath.Join(gaieRoot, "config", "crd", "bases")
@@ -538,7 +542,7 @@ func inferencePoolCRDs() []string {
 }
 
 func fetchGAIECRDs() []string {
-	version := eppImage[strings.LastIndex(eppImage, ":")+1:]
+	version := gaieVersion
 
 	cacheDir := filepath.Join(projectRoot(), ".cache", "gaie-crds", version)
 	paths := make([]string, len(gaieInferencePoolCRDs))
