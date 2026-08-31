@@ -28,11 +28,15 @@ func TestGetAsyncProcessorCollectors_includesGauges(t *testing.T) {
 	for _, withLatency := range []bool{false, true} {
 		collectors := GetAsyncProcessorCollectors(withLatency)
 		for name, gauge := range map[string]prometheus.Collector{
-			"QueueDepth":       QueueDepth,
-			"InflightRequests": InflightRequests,
-			"BrokerBacklog":    BrokerBacklog,
-			"DispatchBudget":   DispatchBudget,
-			"PoolWorkerLimit":  PoolWorkerLimit,
+			"QueueDepth":                   QueueDepth,
+			"InflightRequests":             InflightRequests,
+			"BrokerBacklog":                BrokerBacklog,
+			"BrokerBacklogSourceAvailable": BrokerBacklogSourceAvailable,
+			"DispatchBudget":               DispatchBudget,
+			"PoolWorkerLimit":              PoolWorkerLimit,
+			"DrainLimitRPS":                DrainLimitRPS,
+			"DrainLimitLeaseValid":         DrainLimitLeaseValid,
+			"DrainLimitValidUntil":         DrainLimitValidUntil,
 		} {
 			if !containsCollector(collectors, gauge) {
 				t.Errorf("expected %s gauge to be present (supportsMessageLatency=%v)", name, withLatency)
@@ -76,6 +80,48 @@ func TestSetPoolWorkerLimit(t *testing.T) {
 	got := testutil.ToFloat64(PoolWorkerLimit.WithLabelValues("pool-a"))
 	if got != 8 {
 		t.Errorf("PoolWorkerLimit = %v, want 8", got)
+	}
+}
+
+func TestSetBrokerBacklogSourceAvailable(t *testing.T) {
+	labels := []string{"q-backlog", "queue-backlog", "pool-backlog"}
+	SetBrokerBacklogSourceAvailable(labels[0], labels[1], labels[2], true)
+	if got := testutil.ToFloat64(BrokerBacklogSourceAvailable.WithLabelValues(labels...)); got != 1 {
+		t.Errorf("BrokerBacklogSourceAvailable = %v, want 1", got)
+	}
+	SetBrokerBacklogSourceAvailable(labels[0], labels[1], labels[2], false)
+	if got := testutil.ToFloat64(BrokerBacklogSourceAvailable.WithLabelValues(labels...)); got != 0 {
+		t.Errorf("BrokerBacklogSourceAvailable = %v, want 0", got)
+	}
+}
+
+func TestRecordDispatchedReq(t *testing.T) {
+	before := testutil.ToFloat64(DispatchedReqs.WithLabelValues("q-dispatch", "queue-dispatch", "pool-dispatch"))
+	RecordDispatchedReq("q-dispatch", "queue-dispatch", "pool-dispatch")
+	got := testutil.ToFloat64(DispatchedReqs.WithLabelValues("q-dispatch", "queue-dispatch", "pool-dispatch"))
+	if got != before+1 {
+		t.Errorf("DispatchedReqs = %v, want %v", got, before+1)
+	}
+}
+
+func TestSetDrainLimit(t *testing.T) {
+	SetDrainLimit("pool-limited", 12.5, 1_700_000_123_000, true)
+	if got := testutil.ToFloat64(DrainLimitRPS.WithLabelValues("pool-limited")); got != 12.5 {
+		t.Errorf("DrainLimitRPS = %v, want 12.5", got)
+	}
+	if got := testutil.ToFloat64(DrainLimitLeaseValid.WithLabelValues("pool-limited")); got != 1 {
+		t.Errorf("DrainLimitLeaseValid = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(DrainLimitValidUntil.WithLabelValues("pool-limited")); got != 1_700_000_123 {
+		t.Errorf("DrainLimitValidUntil = %v, want 1700000123", got)
+	}
+
+	SetDrainLimit("pool-limited", 99, 1_800_000_000_000, false)
+	if got := testutil.ToFloat64(DrainLimitRPS.WithLabelValues("pool-limited")); got != 0 {
+		t.Errorf("invalid lease DrainLimitRPS = %v, want 0", got)
+	}
+	if got := testutil.ToFloat64(DrainLimitLeaseValid.WithLabelValues("pool-limited")); got != 0 {
+		t.Errorf("invalid lease DrainLimitLeaseValid = %v, want 0", got)
 	}
 }
 

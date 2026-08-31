@@ -43,6 +43,10 @@ var (
 		Subsystem: SchedulerSubsystem, Name: "async_request_total",
 		Help: "Total number of async requests.",
 	}, queueLabels)
+	DispatchedReqs = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: SchedulerSubsystem, Name: "async_dispatched_requests_total",
+		Help: "Total number of downstream inference dispatch attempts, including retries. Apply rate() to this counter to observe the batch admission rate.",
+	}, queueLabels)
 	ExceededDeadlineReqs = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Subsystem: SchedulerSubsystem, Name: "async_exceeded_deadline_requests_total",
 		Help: "Total number of async requests that exceeded their deadline.",
@@ -109,6 +113,10 @@ var (
 		Subsystem: SchedulerSubsystem, Name: "async_broker_backlog",
 		Help: "Number of undelivered/pending messages held by the broker queue.",
 	}, queueLabels)
+	BrokerBacklogSourceAvailable = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Subsystem: SchedulerSubsystem, Name: "async_broker_backlog_source_available",
+		Help: "1 when the most recent broker-backlog read for the queue succeeded; 0 when the source was unavailable or returned an error.",
+	}, queueLabels)
 	DispatchBudget = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Subsystem: SchedulerSubsystem, Name: "async_dispatch_budget",
 		Help: "Current dispatch budget [0.0-1.0] returned by the queue's gate; the fraction of system capacity available for new requests (0.0 = gate fully closed).",
@@ -116,6 +124,18 @@ var (
 	PoolWorkerLimit = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Subsystem: SchedulerSubsystem, Name: "async_pool_worker_limit",
 		Help: "Configured number of concurrent workers (the concurrency limit) for a pool. Compare against async_inflight_requests for worker utilization.",
+	}, []string{LabelPoolName})
+	DrainLimitRPS = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Subsystem: SchedulerSubsystem, Name: "async_drain_limit_rps",
+		Help: "Leased maximum downstream admission rate observed by the most recent gate evaluation for a worker pool. Zero with observed lease_valid=1 means an explicit pause.",
+	}, []string{LabelPoolName})
+	DrainLimitLeaseValid = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Subsystem: SchedulerSubsystem, Name: "async_drain_limit_lease_valid",
+		Help: "1 when the most recent gate evaluation observed a syntactically valid, unexpired external drain-limit lease; 0 when that evaluation found it missing, malformed, mismatched, expired, or unreadable. This observation does not self-expire while the gate is idle; combine it with valid_until_seconds > time().",
+	}, []string{LabelPoolName})
+	DrainLimitValidUntil = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Subsystem: SchedulerSubsystem, Name: "async_drain_limit_valid_until_seconds",
+		Help: "Unix timestamp in seconds at which the valid external drain-limit lease observed by the most recent gate evaluation expires. Zero when that evaluation observed no valid lease.",
 	}, []string{LabelPoolName})
 	GateDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Subsystem: SchedulerSubsystem, Name: "async_gate_decisions_total",
@@ -311,6 +331,12 @@ func RecordAsyncReq(queueID, queueName, poolName string) {
 	AsyncReqs.WithLabelValues(queueID, queueName, poolName).Inc()
 }
 
+// RecordDispatchedReq records an attempt that is about to consume downstream
+// inference capacity. Unlike RecordAsyncReq, retries are intentionally counted.
+func RecordDispatchedReq(queueID, queueName, poolName string) {
+	DispatchedReqs.WithLabelValues(queueID, queueName, poolName).Inc()
+}
+
 func RecordExceededDeadlineReq(queueID, queueName, poolName string) {
 	ExceededDeadlineReqs.WithLabelValues(queueID, queueName, poolName).Inc()
 }
@@ -380,6 +406,16 @@ func SetBrokerBacklog(queueID, queueName, poolName string, n float64) {
 	BrokerBacklog.WithLabelValues(queueID, queueName, poolName).Set(n)
 }
 
+// SetBrokerBacklogSourceAvailable records whether the most recent broker-side
+// backlog read produced a trustworthy value for a queue.
+func SetBrokerBacklogSourceAvailable(queueID, queueName, poolName string, available bool) {
+	v := 0.0
+	if available {
+		v = 1.0
+	}
+	BrokerBacklogSourceAvailable.WithLabelValues(queueID, queueName, poolName).Set(v)
+}
+
 // SetDispatchBudget sets the current dispatch budget [0.0-1.0] for a queue's gate.
 func SetDispatchBudget(budget float64, queueID, queueName, poolName string) {
 	DispatchBudget.WithLabelValues(queueID, queueName, poolName).Set(budget)
@@ -388,6 +424,23 @@ func SetDispatchBudget(budget float64, queueID, queueName, poolName string) {
 // SetPoolWorkerLimit sets the configured worker concurrency limit for a pool.
 func SetPoolWorkerLimit(poolName string, n float64) {
 	PoolWorkerLimit.WithLabelValues(poolName).Set(n)
+}
+
+// SetDrainLimit records the external controller lease observed by the most
+// recent gate evaluation. Callers determine live validity by comparing the
+// exported valid-until timestamp with the current time.
+func SetDrainLimit(poolName string, maxAdmissionRPS float64, validUntilUnixMillis int64, leaseValid bool) {
+	if !leaseValid {
+		maxAdmissionRPS = 0
+		validUntilUnixMillis = 0
+	}
+	valid := 0.0
+	if leaseValid {
+		valid = 1.0
+	}
+	DrainLimitRPS.WithLabelValues(poolName).Set(maxAdmissionRPS)
+	DrainLimitLeaseValid.WithLabelValues(poolName).Set(valid)
+	DrainLimitValidUntil.WithLabelValues(poolName).Set(float64(validUntilUnixMillis) / 1000.0)
 }
 
 // RecordGateDecision increments the count of gate decisions that prevented a
@@ -433,10 +486,10 @@ func SetGateMetricSourceAvailable(available bool, queueID, queueName, poolName, 
 // GetCollectors returns all custom collectors for the async processor.
 func GetAsyncProcessorCollectors(supportsMessageLatency bool) []prometheus.Collector {
 	collectors := []prometheus.Collector{
-		Retries, AsyncReqs, ExceededDeadlineReqs, FailedReqs, SuccessfulReqs, SheddedRequests, Tokens,
-		QueueDepth, InflightRequests, BrokerBacklog, InferenceLatencyTime, QueueResidenceTime,
+		Retries, AsyncReqs, DispatchedReqs, ExceededDeadlineReqs, FailedReqs, SuccessfulReqs, SheddedRequests, Tokens,
+		QueueDepth, InflightRequests, BrokerBacklog, BrokerBacklogSourceAvailable, InferenceLatencyTime, QueueResidenceTime,
 		DeadlineProximity,
-		DispatchBudget, PoolWorkerLimit, GateDecisions,
+		DispatchBudget, PoolWorkerLimit, DrainLimitRPS, DrainLimitLeaseValid, DrainLimitValidUntil, GateDecisions,
 		GateMetricValue, GateMetricThreshold, GateMetricSourceAvailable,
 	}
 	if supportsMessageLatency {
