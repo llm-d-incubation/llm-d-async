@@ -12,10 +12,12 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/llm-d/llm-d-async/pipeline"
+	"github.com/llm-d/llm-d-async/pkg/asyncworker"
 	"github.com/llm-d/llm-d-async/pkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -333,4 +335,16 @@ func histogramFor(t *testing.T, c prometheus.Collector, wantLabels map[string]st
 	}
 	t.Fatalf("no histogram matched labels %v", wantLabels)
 	return nil
+}
+
+func TestGateWaitTimeoutOption(t *testing.T) {
+	opts := NewOptions()
+	if opts.Worker.GateWaitTimeout != asyncworker.DefaultGateWaitTimeout {
+		t.Fatalf("default gate wait timeout = %v, want %v", opts.Worker.GateWaitTimeout, asyncworker.DefaultGateWaitTimeout)
+	}
+	opts.RedisConnection.URL = "redis://localhost:6379"
+	opts.Worker.GateWaitTimeout = -time.Second
+	if err := opts.Validate(); err == nil || !strings.Contains(err.Error(), "--gate-wait-timeout must be non-negative") {
+		t.Fatalf("Validate() error = %v, want negative gate-wait-timeout error", err)
+	}
 }
