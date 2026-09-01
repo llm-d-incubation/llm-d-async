@@ -65,24 +65,24 @@ func TestRandomRobinPolicy_ConcurrentProducers(t *testing.T) {
 		}(chIdx)
 	}
 
-	// Consume all messages from the merged channel.
+	// Consume the expected messages from the merged channel. Dynamic fan-in
+	// channels stay open after their sources close so queues can be added later.
 	received := make(map[string]bool)
-	done := make(chan struct{})
-	go func() {
-		for msg := range mergedChan {
+	const expected = numChannels * msgsPerChannel
+	deadline := time.After(10 * time.Second)
+	for len(received) < expected {
+		select {
+		case msg := <-mergedChan:
+			if msg.InternalRequest == nil || msg.InternalRequest.PublicRequest == nil {
+				t.Fatal("merged channel returned an invalid message")
+			}
 			received[msg.InternalRequest.PublicRequest.ReqID()] = true
+		case <-deadline:
+			t.Fatalf("Timed out waiting for merged messages: got %d of %d", len(received), expected)
 		}
-		close(done)
-	}()
-
-	wg.Wait()
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("Timed out waiting for merged channel to close")
 	}
+	wg.Wait()
 
-	expected := numChannels * msgsPerChannel
 	assert.Equal(t, expected, len(received), "Expected %d unique messages, got %d", expected, len(received))
 
 	// Verify every expected message was received.
