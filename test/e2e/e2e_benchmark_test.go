@@ -365,10 +365,21 @@ func patchSimArgs(args []string) {
 	gomega.Eventually(session).WithTimeout(120 * time.Second).Should(gexec.Exit(0))
 
 	// Ensure the newly rolled-out sim pod is ready and accepting requests on simAdminURL
-	gomega.Eventually(func(g gomega.Gomega) {
-		resp, err := http.Get(simAdminURL + "/metrics")
-		g.Expect(err).NotTo(gomega.HaveOccurred())
+	gomega.Eventually(func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, simAdminURL+"/metrics", nil)
+		if err != nil {
+			return err
+		}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return err
+		}
 		defer resp.Body.Close() //nolint:errcheck
-		g.Expect(resp.StatusCode).To(gomega.Equal(http.StatusOK))
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		}
+		return nil
 	}, 60*time.Second, 1*time.Second).Should(gomega.Succeed())
 }
