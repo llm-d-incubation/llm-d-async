@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"net/http"
 	"os/exec"
 	"strings"
 	"sync"
@@ -308,7 +309,7 @@ var _ = ginkgo.Describe("Async Processor Performance Benchmark E2E", ginkgo.Orde
 		ginkgo.By("Waiting for all messages to be processed by pub/sub with prometheus gate")
 		gomega.Eventually(func() int64 {
 			return receivedCount.Load()
-		}, 5*time.Minute, 1*time.Second).Should(gomega.Equal(int64(numRequests)))
+		}, 10*time.Minute, 1*time.Second).Should(gomega.Equal(int64(numRequests)))
 
 		elapsedTime := time.Since(startTime)
 		monitorCancel()
@@ -362,4 +363,12 @@ func patchSimArgs(args []string) {
 	session, err = gexec.Start(cmd, ginkgo.GinkgoWriter, ginkgo.GinkgoWriter)
 	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
 	gomega.Eventually(session).WithTimeout(120 * time.Second).Should(gexec.Exit(0))
+
+	// Ensure the newly rolled-out sim pod is ready and accepting requests on simAdminURL
+	gomega.Eventually(func(g gomega.Gomega) {
+		resp, err := http.Get(simAdminURL + "/metrics")
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+		defer resp.Body.Close() //nolint:errcheck
+		g.Expect(resp.StatusCode).To(gomega.Equal(http.StatusOK))
+	}, 60*time.Second, 1*time.Second).Should(gomega.Succeed())
 }

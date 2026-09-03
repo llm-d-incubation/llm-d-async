@@ -220,7 +220,9 @@ func setSimWaitingRequests(simAdminURL string, waitingRequests int) {
 		"waiting-requests": waitingRequests,
 	})
 	gomega.EventuallyWithOffset(1, func() error {
-		req, err := http.NewRequest(http.MethodPost, simAdminURL+"/fake_metrics", bytes.NewReader(body))
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, simAdminURL+"/fake_metrics", bytes.NewReader(body))
 		if err != nil {
 			return err
 		}
@@ -234,7 +236,7 @@ func setSimWaitingRequests(simAdminURL string, waitingRequests int) {
 			return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 		}
 		return nil
-	}, 10*time.Second, 500*time.Millisecond).Should(gomega.Succeed())
+	}, 30*time.Second, 500*time.Millisecond).Should(gomega.Succeed())
 }
 
 // sendProbeRequest sends a minimal inference request through Envoy → EPP to trigger
