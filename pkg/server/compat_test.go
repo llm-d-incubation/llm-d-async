@@ -94,6 +94,12 @@ func TestSynthesizeRedisSortedSetConfig_SingleQueueGate(t *testing.T) {
 	if q.GateParams["threshold"] != 0.7 {
 		t.Errorf("GateParams[threshold] = %v, want 0.7", q.GateParams["threshold"])
 	}
+
+	// The synthesized blob must satisfy the real loader end to end (defaults
+	// for claim lease/reclaim are applied by LoadSortedSetConfig).
+	if _, err := redis.LoadSortedSetConfig(data); err != nil {
+		t.Errorf("LoadSortedSetConfig rejected synthesized config: %v", err)
+	}
 }
 
 func TestSynthesizePubSubConfig_SingleTopic(t *testing.T) {

@@ -55,6 +55,34 @@ func envelopeJSON(rm api.RequestMessage) string {
 	return string(b)
 }
 
+func registerTestClaim(ctx context.Context, flow *RedisSortedSetFlow, queueName, reqID, reqToken string) {
+	token := "token-" + reqID
+	if reqToken != "" {
+		token += "-" + reqToken
+	}
+	ir := api.NewInternalRequest(
+		api.InternalRouting{RequestQueueName: queueName, RequestToken: reqToken},
+		&api.RequestMessage{
+			ID:       reqID,
+			Created:  time.Now().Unix(),
+			Deadline: time.Now().Add(time.Hour).Unix(),
+			Payload:  map[string]any{"model": "test"},
+		},
+	)
+	payloadBytes, _ := json.Marshal(ir)
+	keys := newClaimKeys(queueName)
+	claimID := claimKey(reqID, reqToken)
+	flow.rdb.HSet(ctx, keys.claimed, claimID, string(payloadBytes))
+	flow.rdb.HSet(ctx, keys.owners, claimID, token)
+	flow.rdb.ZAdd(ctx, keys.idx, redis.Z{Score: float64(time.Now().Add(time.Hour).Unix()), Member: claimID})
+	flow.claimTokens.Store(claimID, &claimHandle{
+		token:        token,
+		queue:        queueName,
+		requestID:    reqID,
+		requestToken: reqToken,
+	})
+}
+
 // mkWorkerRuntime wraps a bare channel and queue identity into the runtime
 // shape requestWorker consumes, for tests that drive a worker directly.
 func mkWorkerRuntime(ch chan *api.InternalRequest, queue, queueID string) *queueRuntime {
@@ -643,6 +671,8 @@ func TestSortedSetFlow_ResultFIFO(t *testing.T) {
 
 	go flow.resultWorker(ctx)
 
+	registerTestClaim(ctx, flow, queue, "first", "")
+	registerTestClaim(ctx, flow, queue, "second", "")
 	flow.resultChannel <- api.ResultMessage{ID: "first", Payload: "result1"}
 	flow.resultChannel <- api.ResultMessage{ID: "second", Payload: "result2"}
 	time.Sleep(100 * time.Millisecond)
@@ -683,6 +713,7 @@ func TestSortedSetFlow_ResultStructuredFields(t *testing.T) {
 		{ID: "gate-drop", Payload: `{"error":"Pool gating dropped request"}`, ErrorCode: api.ErrCodeGateDropped, ErrorMessage: "Pool gating dropped request"},
 	}
 	for _, m := range messages {
+		registerTestClaim(ctx, flow, queue, m.ID, "")
 		flow.resultChannel <- m
 	}
 
@@ -749,6 +780,7 @@ func TestSortedSetFlow_ResultBatchClearsCancellationMarkers(t *testing.T) {
 		gate:                   noopGate(),
 	}
 
+	registerTestClaim(ctx, flow, queue, cancelledID, requestToken)
 	go flow.resultWorker(ctx)
 	flow.resultChannel <- api.NewCancelledResult(&api.RequestMessage{ID: cancelledID}, api.InternalRouting{RequestToken: requestToken})
 
@@ -765,11 +797,20 @@ func TestSortedSetFlow_ResultBatchClearsCancellationMarkers(t *testing.T) {
 		}
 	}
 
-	if exists, _ := rdb.Exists(ctx, api.RequestCancellationKey(cancelledID)).Result(); exists != 0 {
-		t.Fatalf("expected cancellation marker for %q to be cleared after result flush", cancelledID)
-	}
-	if exists, _ := rdb.Exists(ctx, api.RequestActiveTokenKey(cancelledID)).Result(); exists != 0 {
-		t.Fatalf("expected active token for %q to be cleared after result flush", cancelledID)
+	// Cleanup runs after the result push becomes visible, so poll for it
+	// rather than asserting in the same instant the list length flips.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		cancelExists, _ := rdb.Exists(ctx, api.RequestCancellationKey(cancelledID)).Result()
+		activeExists, _ := rdb.Exists(ctx, api.RequestActiveTokenKey(cancelledID)).Result()
+		if cancelExists == 0 && activeExists == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected request state for %q cleared after result flush (cancel=%d active=%d)",
+				cancelledID, cancelExists, activeExists)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -796,6 +837,7 @@ func TestSortedSetFlow_OldResultDoesNotClearNewGenerationCancellation(t *testing
 		gate:                   noopGate(),
 	}
 
+	registerTestClaim(ctx, flow, queue, requestID, oldToken)
 	go flow.resultWorker(ctx)
 	flow.resultChannel <- api.NewCancelledResult(&api.RequestMessage{ID: requestID}, api.InternalRouting{RequestToken: oldToken})
 
@@ -840,8 +882,10 @@ func TestSortedSetFlow_ResultBatch(t *testing.T) {
 	// are available for a single batch drain.
 	numMessages := 10
 	for i := 0; i < numMessages; i++ {
+		id := "batch-" + strconv.Itoa(i)
+		registerTestClaim(ctx, flow, queue, id, "")
 		flow.resultChannel <- api.ResultMessage{
-			ID:      "batch-" + strconv.Itoa(i),
+			ID:      id,
 			Payload: "data-" + strconv.Itoa(i),
 		}
 	}
@@ -891,6 +935,8 @@ func TestSortedSetFlow_ResultTTL(t *testing.T) {
 
 	go flow.resultWorker(ctx)
 
+	registerTestClaim(ctx, flow, "results:req:ttl-1", "ttl-1", "")
+	registerTestClaim(ctx, flow, "belt-results", "plain-1", "")
 	// Per-message result key routing from a queue with result_ttl_seconds:
 	// the destination key gets an expiry.
 	flow.resultChannel <- api.ResultMessage{
@@ -944,6 +990,10 @@ func TestSortedSetFlow_ResultBatchMultiQueue(t *testing.T) {
 		},
 	}
 
+	registerTestClaim(ctx, flow, "request:queue-a", "a-1", "")
+	registerTestClaim(ctx, flow, "request:queue-b", "b-1", "")
+	registerTestClaim(ctx, flow, "request:queue-a", "a-2", "")
+	registerTestClaim(ctx, flow, defaultQueue, "no-id", "")
 	flow.resultChannel <- api.ResultMessage{ID: "a-1", Payload: "d1", Routing: api.InternalRouting{QueueID: "queue-a"}}
 	flow.resultChannel <- api.ResultMessage{ID: "b-1", Payload: "c1", Routing: api.InternalRouting{QueueID: "queue-b"}}
 	flow.resultChannel <- api.ResultMessage{ID: "a-2", Payload: "d2", Routing: api.InternalRouting{QueueID: "queue-a"}}
@@ -1237,6 +1287,8 @@ func TestSortedSetFlow_ResultRetryAfterFailure(t *testing.T) {
 		gate:                   noopGate(),
 	}
 
+	registerTestClaim(ctx, flow, queue, "retry-msg", "")
+
 	// Inject an error so the first Exec fails.
 	s.SetError("READONLY simulated failure")
 
@@ -1379,6 +1431,161 @@ func TestSortedSetFlow_RetryBatchAfterFailure(t *testing.T) {
 	t.Fatal("Expected retry message to be enqueued after transient Redis failure")
 }
 
+func TestSortedSetFlow_ResultSustainedOutage_DropsClaimHandle(t *testing.T) {
+	s, rdb, ctx, cancel := setupTest(t)
+	defer s.Close()
+	defer rdb.Close() // nolint:errcheck
+	defer cancel()
+
+	queue := "sustained-result-queue"
+	flow := &RedisSortedSetFlow{
+		defaultResultQueueName: queue,
+		rdb:                    rdb,
+		resultChannel:          make(chan api.ResultMessage, resultChannelBuffer),
+		pollInterval:           50 * time.Millisecond,
+		batchSize:              10,
+		gate:                   noopGate(),
+		queues: map[string]*queueRuntime{
+			queue: {data: requestChannelData{queueName: queue, queueID: queue}},
+		},
+		queueOrder: []string{queue},
+	}
+
+	registerTestClaim(ctx, flow, queue, "sustained-msg", "")
+
+	// Inject permanent error so retries are completely exhausted.
+	s.SetError("READONLY simulated permanent failure")
+
+	go flow.resultWorker(ctx)
+
+	flow.resultChannel <- api.ResultMessage{ID: "sustained-msg", Payload: "data"}
+
+	// Wait for retryRedisOp to exhaust retries and verify claim handle is removed.
+	deadline := time.Now().Add(5 * time.Second)
+	handleDropped := false
+	for time.Now().Before(deadline) {
+		if _, ok := flow.claimTokens.Load(claimKey("sustained-msg", "")); !ok {
+			handleDropped = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !handleDropped {
+		t.Fatal("expected claim handle to be deleted after sustained Redis outage on result flush")
+	}
+
+	// Redis recovers after the sustained outage.
+	s.SetError("")
+
+	// Expire the lease in Redis claim index by backdating its expiry score.
+	keys := newClaimKeys(queue)
+	claimID := claimKey("sustained-msg", "")
+	flow.rdb.ZAdd(ctx, keys.idx, redis.Z{Score: float64(time.Now().Add(-10 * time.Second).Unix()), Member: claimID})
+
+	// Reclaimer runs: with the local handle gone, heartbeats were stopped,
+	// allowing the expired lease to be reclaimed and redelivered to pending.
+	released, err := flow.reclaimExpiredClaims(ctx)
+	if err != nil {
+		t.Fatalf("reclaimExpiredClaims failed: %v", err)
+	}
+	if released != 1 {
+		t.Fatalf("expected 1 released claim, got %d", released)
+	}
+
+	// Verify the request has returned to the pending sorted set.
+	pendingCount, err := rdb.ZCard(ctx, queue).Result()
+	if err != nil || pendingCount != 1 {
+		t.Fatalf("expected 1 request in pending queue, got %d (err: %v)", pendingCount, err)
+	}
+	claimedExists, _ := rdb.HExists(ctx, keys.claimed, claimID).Result()
+	if claimedExists {
+		t.Fatal("expected claimed hash entry to be removed after reclaim")
+	}
+}
+
+func TestSortedSetFlow_RetrySustainedOutage_DropsClaimHandle(t *testing.T) {
+	s, rdb, ctx, cancel := setupTest(t)
+	defer s.Close()
+	defer rdb.Close() // nolint:errcheck
+	defer cancel()
+
+	queue := "sustained-retry-queue"
+	flow := &RedisSortedSetFlow{
+		rdb:          rdb,
+		retryChannel: make(chan pipeline.RetryMessage, 10),
+		pollInterval: 50 * time.Millisecond,
+		batchSize:    10,
+		gate:         noopGate(),
+		queues: map[string]*queueRuntime{
+			queue: {data: requestChannelData{queueName: queue, queueID: queue}},
+		},
+		queueOrder: []string{queue},
+	}
+
+	registerTestClaim(ctx, flow, queue, "sustained-retry-msg", "token-1")
+
+	// Inject permanent error so retries are completely exhausted.
+	s.SetError("READONLY simulated permanent failure")
+
+	go flow.retryWorker(ctx)
+
+	flow.retryChannel <- pipeline.RetryMessage{
+		EmbelishedRequestMessage: pipeline.EmbelishedRequestMessage{
+			InternalRequest: api.NewInternalRequest(
+				api.InternalRouting{RequestQueueName: queue, RequestToken: "token-1"},
+				&api.RequestMessage{
+					ID:       "sustained-retry-msg",
+					Created:  time.Now().Unix(),
+					Deadline: 9999999999,
+				},
+			),
+		},
+		BackoffDurationSeconds: 0,
+	}
+
+	// Wait for retryRedisOp to exhaust retries and verify claim handle is removed.
+	deadline := time.Now().Add(5 * time.Second)
+	handleDropped := false
+	for time.Now().Before(deadline) {
+		if _, ok := flow.claimTokens.Load(claimKey("sustained-retry-msg", "token-1")); !ok {
+			handleDropped = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !handleDropped {
+		t.Fatal("expected claim handle to be deleted after sustained Redis outage on retry flush")
+	}
+
+	// Redis recovers after the sustained outage.
+	s.SetError("")
+
+	// Expire the lease in Redis claim index by backdating its expiry score.
+	keys := newClaimKeys(queue)
+	retryClaimID := claimKey("sustained-retry-msg", "token-1")
+	flow.rdb.ZAdd(ctx, keys.idx, redis.Z{Score: float64(time.Now().Add(-10 * time.Second).Unix()), Member: retryClaimID})
+
+	// Reclaimer runs: with the local handle gone, heartbeats were stopped,
+	// allowing the expired lease to be reclaimed and redelivered to pending.
+	released, err := flow.reclaimExpiredClaims(ctx)
+	if err != nil {
+		t.Fatalf("reclaimExpiredClaims failed: %v", err)
+	}
+	if released != 1 {
+		t.Fatalf("expected 1 released claim, got %d", released)
+	}
+
+	// Verify the request has returned to the pending sorted set.
+	pendingCount, err := rdb.ZCard(ctx, queue).Result()
+	if err != nil || pendingCount != 1 {
+		t.Fatalf("expected 1 request in pending queue, got %d (err: %v)", pendingCount, err)
+	}
+	claimedExists, _ := rdb.HExists(ctx, keys.claimed, retryClaimID).Result()
+	if claimedExists {
+		t.Fatal("expected claimed hash entry to be removed after reclaim")
+	}
+}
+
 func TestSortedSetFlow_PartialBudget(t *testing.T) {
 	s, rdb, ctx, cancel := setupTest(t)
 	defer s.Close()
@@ -1504,8 +1711,9 @@ func TestSortedSetFlow_RequestWorkerRequeuesOnShutdown(t *testing.T) {
 	}
 
 	results, _ := rdb.ZRangeWithScores(ctx, queue, 0, -1).Result()
-	if results[0].Score != score {
-		t.Errorf("Expected re-queued score %f, got %f", score, results[0].Score)
+	// Re-queue restores message to pending at its deadline score (9999999999).
+	if results[0].Score != 9999999999 {
+		t.Errorf("Expected re-queued score 9999999999 (deadline), got %f", results[0].Score)
 	}
 	var restored api.InternalRequest
 	json.Unmarshal([]byte(results[0].Member.(string)), &restored) // nolint:errcheck
@@ -1648,6 +1856,7 @@ func TestSortedSetFlow_ResultQueueIgnoresMessagePayload(t *testing.T) {
 		},
 	}
 
+	registerTestClaim(ctx, flow, configResult, "test-1", "")
 	flow.resultChannel <- api.ResultMessage{
 		ID:      "test-1",
 		Payload: "data",
@@ -1689,12 +1898,14 @@ func TestSortedSetFlow_ResultQueueFallsBackToMessageLevel(t *testing.T) {
 	}
 
 	// Config exists but has no ResultQueueName → should fall back to message-level
+	registerTestClaim(ctx, flow, "req", "fallback-1", "")
 	flow.resultChannel <- api.ResultMessage{
 		ID:      "fallback-1",
 		Payload: "data",
 		Routing: api.InternalRouting{QueueID: "no-result-cfg", ResultQueueName: messageResult},
 	}
 	// No config match and no message-level → should fall back to global default
+	registerTestClaim(ctx, flow, "global-default", "global-1", "")
 	flow.resultChannel <- api.ResultMessage{
 		ID:      "global-1",
 		Payload: "data",

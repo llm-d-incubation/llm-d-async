@@ -1,6 +1,9 @@
 package redis
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestREDIS_URL_IsDefaultNotOverride guards the regression where REDIS_URL
 // overwrote an explicit url from the transport config on every load. It must be
@@ -52,6 +55,47 @@ func TestREDIS_URL_IsDefaultNotOverride(t *testing.T) {
 			t.Errorf("URL = %q, want the REDIS_URL fallback", cfg.URL)
 		}
 	})
+}
+
+func TestSortedSetConfig_ValidateNegativeValues(t *testing.T) {
+	cases := []struct {
+		name    string
+		json    string
+		wantErr string
+	}{
+		{
+			name:    "negative claim_lease_ttl_seconds",
+			json:    `{"url":"redis://localhost:6379","claim_lease_ttl_seconds":-1,"queues":[{"queue_name":"q","igw_base_url":"http://gw"}]}`,
+			wantErr: "claim_lease_ttl_seconds must be non-negative",
+		},
+		{
+			name:    "negative claim_reclaim_interval_ms",
+			json:    `{"url":"redis://localhost:6379","claim_reclaim_interval_ms":-500,"queues":[{"queue_name":"q","igw_base_url":"http://gw"}]}`,
+			wantErr: "claim_reclaim_interval_ms must be non-negative",
+		},
+		{
+			name:    "negative poll_interval_ms",
+			json:    `{"url":"redis://localhost:6379","poll_interval_ms":-10,"queues":[{"queue_name":"q","igw_base_url":"http://gw"}]}`,
+			wantErr: "poll_interval_ms must be non-negative",
+		},
+		{
+			name:    "negative batch_size",
+			json:    `{"url":"redis://localhost:6379","batch_size":-5,"queues":[{"queue_name":"q","igw_base_url":"http://gw"}]}`,
+			wantErr: "batch_size must be non-negative",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadSortedSetConfig([]byte(tc.json))
+			if err == nil {
+				t.Fatalf("LoadSortedSetConfig expected error containing %q, got nil", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("LoadSortedSetConfig error %q does not contain %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
 }
 
 func TestSortedSetConfigEmptyQueuesOnlyAllowedForReload(t *testing.T) {

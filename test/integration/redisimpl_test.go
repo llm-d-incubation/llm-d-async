@@ -9,6 +9,7 @@ import (
 	"time"
 
 	randomrobin "github.com/llm-d/llm-d-async/pkg/async/mergepolicy/randomrobin"
+	goredis "github.com/redis/go-redis/v9"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/llm-d/llm-d-async/api"
@@ -105,7 +106,7 @@ func TestRedisImplWithAuth(t *testing.T) {
 	cfg := redis.SortedSetConfig{
 		URL:             redisURL,
 		ResultQueueName: "result-list",
-		PollIntervalMs:  1000,
+		PollIntervalMs:  50,
 		BatchSize:       10,
 		Queues: []redis.SortedSetQueueConfig{{
 			QueueName:      "request-sortedset",
@@ -124,13 +125,61 @@ func TestRedisImplWithAuth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	flow.Start(ctx)
 
-	flow.ResultChannel() <- api.ResultMessage{
-		ID: "test-auth-id",
+	pools := map[string]pipeline.WorkerPoolConfig{
+		"default": {ID: "default", Workers: 1},
+	}
+	dispatch := randomrobin.NewRandomRobinPolicy("test", randomrobin.Config{}).
+		MergeRequestChannels(flow.RequestChannels(), pools)
+	mergedChannel := dispatch.Channels["default"]
+
+	flow.Start(ctx)
+	defer func() {
+		flow.StopConsuming()
+		flow.Shutdown()
+	}()
+
+	rdb := goredis.NewClient(&goredis.Options{
+		Addr:     fmt.Sprintf("%s:%s", s.Host(), s.Port()),
+		Password: "test-password",
+	})
+	defer rdb.Close() // nolint:errcheck
+
+	ir := api.NewInternalRequest(
+		api.InternalRouting{RequestQueueName: "request-sortedset"},
+		&api.RequestMessage{
+			ID:       "test-auth-id",
+			Created:  time.Now().Unix(),
+			Deadline: time.Now().Add(5 * time.Minute).Unix(),
+			Payload:  map[string]any{"model": "test"},
+		},
+	)
+	member, err := ir.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rdb.ZAdd(ctx, "request-sortedset", goredis.Z{
+		Score:  float64(time.Now().Add(5 * time.Minute).Unix()),
+		Member: string(member),
+	}).Err(); err != nil {
+		t.Fatal(err)
 	}
 
-	time.Sleep(1 * time.Second)
+	select {
+	case req := <-mergedChannel:
+		if req.PublicRequest == nil || req.PublicRequest.ReqID() != "test-auth-id" {
+			t.Fatalf("Expected message id to be test-auth-id, got %v", req.PublicRequest)
+		}
+		flow.ResultChannel() <- api.ResultMessage{
+			ID:      req.PublicRequest.ReqID(),
+			Payload: "",
+			Routing: req.InternalRouting,
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for request to be claimed and dispatched")
+	}
+
+	time.Sleep(200 * time.Millisecond)
 
 	s.CheckList(t, "result-list", `{"id":"test-auth-id","payload":""}`)
 }

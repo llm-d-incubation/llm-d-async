@@ -83,12 +83,19 @@ type SortedSetConfig struct {
 	// RetryQueueName is the sorted set holding backoff retries, scored by
 	// retry-due time. Retries re-enter their request queue (with the original
 	// deadline score) only once due, so backoff is actually enforced.
-	RetryQueueName  string                 `json:"retry_queue_name,omitempty"`
-	ResultQueueName string                 `json:"result_queue_name,omitempty"`
-	PollIntervalMs  int                    `json:"poll_interval_ms,omitempty"`
-	BatchSize       int                    `json:"batch_size,omitempty"`
-	EnableTracing   bool                   `json:"enable_tracing,omitempty"`
-	Queues          []SortedSetQueueConfig `json:"queues"`
+	RetryQueueName  string `json:"retry_queue_name,omitempty"`
+	ResultQueueName string `json:"result_queue_name,omitempty"`
+	PollIntervalMs  int    `json:"poll_interval_ms,omitempty"`
+	BatchSize       int    `json:"batch_size,omitempty"`
+	EnableTracing   bool   `json:"enable_tracing,omitempty"`
+	// ClaimLeaseTTLSeconds bounds how long one consumer may hold a dequeued
+	// request before survivors treat it as abandoned and redeliver it.
+	// Should exceed the longest possible inference time for the queues served.
+	ClaimLeaseTTLSeconds int64 `json:"claim_lease_ttl_seconds,omitempty"`
+	// ClaimReclaimIntervalMs is how often expired claims are scanned for
+	// redelivery.
+	ClaimReclaimIntervalMs int64                  `json:"claim_reclaim_interval_ms,omitempty"`
+	Queues                 []SortedSetQueueConfig `json:"queues"`
 }
 
 // LoadSortedSetConfig parses, applies env overrides/defaults, and validates a SortedSetConfig.
@@ -137,6 +144,15 @@ func (c *SortedSetConfig) ApplyDefaults() {
 	if c.BatchSize == 0 {
 		c.BatchSize = 10
 	}
+	// Durable-dequeue defaults: a 5-minute lease comfortably exceeds
+	// typical inference latencies while keeping crash redelivery bounded;
+	// claims are scanned every 15s.
+	if c.ClaimLeaseTTLSeconds == 0 {
+		c.ClaimLeaseTTLSeconds = 300
+	}
+	if c.ClaimReclaimIntervalMs == 0 {
+		c.ClaimReclaimIntervalMs = 15000
+	}
 	for i := range c.Queues {
 		if c.Queues[i].RequestPathURL == "" {
 			c.Queues[i].RequestPathURL = "/v1/completions"
@@ -157,6 +173,18 @@ func (c *SortedSetConfig) Validate() error {
 func (c *SortedSetConfig) validate(allowEmptyQueues bool) error {
 	if c.URL == "" {
 		return fmt.Errorf("url is required (set url in the transport config or REDIS_URL)")
+	}
+	if c.PollIntervalMs < 0 {
+		return fmt.Errorf("poll_interval_ms must be non-negative")
+	}
+	if c.BatchSize < 0 {
+		return fmt.Errorf("batch_size must be non-negative")
+	}
+	if c.ClaimLeaseTTLSeconds < 0 {
+		return fmt.Errorf("claim_lease_ttl_seconds must be non-negative")
+	}
+	if c.ClaimReclaimIntervalMs < 0 {
+		return fmt.Errorf("claim_reclaim_interval_ms must be non-negative")
 	}
 	if !allowEmptyQueues && len(c.Queues) == 0 {
 		return fmt.Errorf("at least one queue must be configured")
