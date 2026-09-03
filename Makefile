@@ -166,6 +166,7 @@ undeploy-ap-on-k8s:
 #   GAIE_VERSION     — GAIE release for CRD fetch       (default: v1.5.0; must match the EPP image's pinned gaie)
 #   SIM_IMAGE        — inference-sim image tag          (default: ghcr.io/llm-d/llm-d-inference-sim:v0.0.0-test)
 #   REDIS_IMAGE      — Redis/Valkey image for E2E MQ    (default: valkey/valkey:8-alpine)
+#   PUBSUB_IMAGE     — Pub/Sub emulator image tag       (default: gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators)
 #   CONTAINER_TOOL   — container runtime                (default: docker)
 #   E2E_SKIP_CLEANUP — set "true" to keep the Kind cluster after tests
 #
@@ -174,11 +175,12 @@ undeploy-ap-on-k8s:
 #   E2E_INTEGRATION_SIM_PORT, E2E_INTEGRATION_ENVOY_PORT,
 #   E2E_INTEGRATION_ENVOY_ADMIN_PORT
 E2E_IMG ?= $(IMAGE_TAG_BASE)/llm-d-async:e2e-test
+PUBSUB_IMAGE ?= gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators
 
 .PHONY: test-e2e
 test-e2e: ## Run e2e integration tests against a Kind cluster
 	@command -v kind >/dev/null 2>&1 || { echo "kind is not installed"; exit 1; }
-	CONTAINER_TOOL=$(CONTAINER_TOOL) AP_IMAGE=$(E2E_IMG) go test ./test/e2e/ -timeout 30m -v -ginkgo.v \
+	CONTAINER_TOOL=$(CONTAINER_TOOL) AP_IMAGE=$(E2E_IMG) PUBSUB_IMAGE=$(PUBSUB_IMAGE) go test ./test/e2e/ -timeout 30m -v -ginkgo.v \
 		$(if $(FOCUS),-ginkgo.focus="$(FOCUS)",) \
 		$(if $(SKIP),-ginkgo.skip="$(SKIP)",)
 
