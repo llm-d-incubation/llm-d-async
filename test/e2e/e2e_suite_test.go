@@ -70,7 +70,7 @@ var (
 	gaieVersion = env.GetEnvString("GAIE_VERSION", "v1.5.0", ginkgo.GinkgoLogr)
 	simImage    = env.GetEnvString("SIM_IMAGE", "ghcr.io/llm-d/llm-d-inference-sim:v0.10.0", ginkgo.GinkgoLogr)
 	redisImage  = env.GetEnvString("REDIS_IMAGE", "valkey/valkey:8-alpine", ginkgo.GinkgoLogr)
-	pubsubImage = env.GetEnvString("PUBSUB_IMAGE", "gcr.io/google.com/cloudsdktool/google-cloud-cli:513.0.0-emulators", ginkgo.GinkgoLogr)
+	pubsubImage = env.GetEnvString("PUBSUB_IMAGE", "gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators", ginkgo.GinkgoLogr)
 	gaieRoot    = os.Getenv("GAIE_ROOT")
 	simRoot     = os.Getenv("SIM_ROOT")
 
