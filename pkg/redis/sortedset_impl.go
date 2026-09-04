@@ -815,10 +815,10 @@ func (r *RedisSortedSetFlow) processMessagesWithConfig(ctx context.Context, msgC
 		member := z.Member.(string)
 		ir, deadline, ok := r.parseMessage(member, logger)
 		if !ok || ir == nil || ir.PublicRequest == nil {
-			// Unparseable entry: no request identity survives to redeliver,
+			// Unparsable entry: no request identity survives to redeliver,
 			// so remove it rather than letting it wedge the peek window.
 			if err := r.rdb.ZRem(ctx, queueName, member).Err(); err != nil {
-				logger.V(logutil.DEFAULT).Error(err, "Failed to remove unparseable message", "queue", queueName)
+				logger.V(logutil.DEFAULT).Error(err, "Failed to remove unparsable message", "queue", queueName)
 			}
 			continue
 		}
