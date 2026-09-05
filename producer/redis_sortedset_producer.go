@@ -257,22 +257,31 @@ func newRequestToken() (string, error) {
 }
 
 // GetResult retrieves a result from the Redis list, blocking until one is available.
+// Cancellation is checked between one-second blocking waits, so an empty queue
+// can delay observing cancellation by approximately one second.
 func (p *RedisSortedSetProducer) GetResult(ctx context.Context) (*api.ResultMessage, error) {
-	// Use BRPOP (blocking right pop) to wait for a result
-	result, err := p.client.BRPop(ctx, 0, p.resultQueueName).Result()
-	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return nil, err
+	// A zero BRPOP timeout blocks indefinitely: go-redis does not interrupt an
+	// in-flight read when the context is cancelled. Bound each empty wait so we
+	// can check the context without leaving a background pop consuming results.
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("failed to get result: %w", err)
 		}
-		return nil, fmt.Errorf("failed to get result: %w", err)
-	}
+		result, err := p.client.BRPop(ctx, time.Second, p.resultQueueName).Result()
+		if errors.Is(err, redis.Nil) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to get result: %w", err)
+		}
 
-	// BRPOP returns [queueName, value]
-	if len(result) != 2 {
-		return nil, errors.New("unexpected BRPOP result format")
-	}
+		// BRPOP returns [queueName, value]
+		if len(result) != 2 {
+			return nil, errors.New("unexpected BRPOP result format")
+		}
 
-	return p.parseResult(result[1])
+		return p.parseResult(result[1])
+	}
 }
 
 // parseResult parses a JSON result message.
