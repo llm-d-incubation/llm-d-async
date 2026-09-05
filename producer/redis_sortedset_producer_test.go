@@ -312,6 +312,75 @@ func TestGetResultWithContextTimeout(t *testing.T) {
 	})
 }
 
+func TestGetResultWhileWaitingContextEnds(t *testing.T) {
+	for _, deadline := range []bool{false, true} {
+		name := "cancel"
+		if deadline {
+			name = "deadline"
+		}
+		t.Run(name, func(t *testing.T) {
+			producer, mr := setupTestProducer(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			want := context.Canceled
+			if deadline {
+				cancel()
+				ctx, cancel = context.WithTimeout(context.Background(), 100*time.Millisecond)
+				want = context.DeadlineExceeded
+			}
+			defer cancel()
+			commands := mr.CommandCount()
+			done := make(chan error, 1)
+			go func() {
+				_, err := producer.GetResult(ctx)
+				done <- err
+			}()
+			require.Eventually(t, func() bool { return mr.CommandCount() > commands }, time.Second, time.Millisecond)
+			if !deadline {
+				cancel()
+			}
+			select {
+			case err := <-done:
+				require.ErrorIs(t, err, want)
+			case <-time.After(2 * time.Second):
+				t.Fatal("GetResult did not return after its context ended")
+			}
+			// A completed wait must release its connection and leave later results
+			// available to the next caller.
+			_, err := mr.Lpush("test-result-queue", `{"id":"next-call"}`)
+			require.NoError(t, err)
+			result, err := producer.GetResult(context.Background())
+			require.NoError(t, err)
+			require.Equal(t, "next-call", result.ID)
+		})
+	}
+}
+
+func TestGetResultWaitsAcrossEmptyPolls(t *testing.T) {
+	producer, mr := setupTestProducer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	commands := mr.CommandCount()
+	type response struct {
+		result *api.ResultMessage
+		err    error
+	}
+	done := make(chan response, 1)
+	go func() {
+		result, err := producer.GetResult(ctx)
+		done <- response{result, err}
+	}()
+	require.Eventually(t, func() bool { return mr.CommandCount() >= commands+2 }, 3*time.Second, time.Millisecond)
+	_, err := mr.Lpush("test-result-queue", `{"id":"after-empty-poll"}`)
+	require.NoError(t, err)
+	select {
+	case got := <-done:
+		require.NoError(t, got.err)
+		require.Equal(t, "after-empty-poll", got.result.ID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("GetResult did not return the queued result")
+	}
+}
+
 func TestMultipleTenantsIsolation(t *testing.T) {
 	// Start mini Redis
 	mr, err := miniredis.Run()
